@@ -1,0 +1,10 @@
+/*
+
+!/src/
+
+!/.gitignore
+!/build.zig
+!/build.zig.zon
+!/LICENSE.txt
+!/README.md
+!/tpgate.def
