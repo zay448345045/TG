@@ -1,5 +1,6 @@
 // library loader hooks
 const std = @import("std");
+const fragments = @import("fragments.zig");
 
 const BOOL = i32;
 const DWORD = u32;
@@ -73,7 +74,7 @@ fn patch(module: HMODULE) bool {
     const base = @intFromPtr(module);
     const pe = base + @as(*align(1) const u32, @ptrFromInt(base + 0x3c)).*;
     const import_rva = @as(*align(1) const u32, @ptrFromInt(pe + 0x90)).*;
-    if (import_rva == 0) return true;
+    if (import_rva == 0) return fragments.restore(module);
     var descriptor = base + import_rva;
     while (@as(*align(1) const u32, @ptrFromInt(descriptor + 12)).* != 0) : (descriptor += 20) {
         const thunk_rva = @as(*align(1) const u32, @ptrFromInt(descriptor + 16)).*;
@@ -91,7 +92,7 @@ fn patch(module: HMODULE) bool {
             slot = @ptrFromInt(@intFromPtr(slot) + @sizeOf(usize));
         }
     }
-    return true;
+    return fragments.restore(module);
 }
 
 fn isBlockedAscii(path: []const u8) bool {
