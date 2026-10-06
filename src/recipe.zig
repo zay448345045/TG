@@ -3,13 +3,12 @@
 const std = @import("std");
 const coff = std.coff;
 const decoder = @import("decoder.zig");
+const compression = @import("compression.zig");
 
 const import_ordinal_flag: u64 = @as(u64, 1) << 63;
 const wrapper_magic = "WWWT";
-const wrapper_size: usize = 0x10;
-const input_limit: usize = 4 << 20;
+const wrapper_size = compression.header_size;
 const output_limit: usize = 8 << 20;
-const output_slack: usize = 0x1000;
 const fields_per_record: usize = 8;
 const max_sections: usize = 256;
 
@@ -217,40 +216,14 @@ fn decodeAt(
 
 fn decodeCandidate(
     allocator: std.mem.Allocator,
-    source: []const u8,
+    wrapper: []const u8,
     table: Table,
 ) DecodeError!?Decoded {
-    if (source.len < 5 or source[0] != 0) return null;
-    var input = std.Io.Reader.fixed(source);
-    var range_decoder = std.compress.lzma.RangeDecoder.init(&input) catch return null;
-    var lzma = std.compress.lzma.Decode.init(
-        allocator,
-        .{ .lc = 3, .lp = 0, .pb = 2 },
-    ) catch return error.OutOfMemory;
-    defer lzma.deinit(allocator);
-    var dictionary = std.compress.lzma.Decode.CircularBuffer.init(
-        output_limit + output_slack,
-        output_limit + output_slack,
-    );
-    defer dictionary.deinit(allocator);
-    var sink: std.Io.Writer.Allocating = .init(allocator);
-    defer sink.deinit();
-
-    decode_loop: while (dictionary.len < output_limit) {
-        var consumed: u64 = 0;
-        const status = lzma.process(
-            &input,
-            &sink,
-            &dictionary,
-            &range_decoder,
-            &consumed,
-        ) catch |decode_error| {
-            if (decode_error == error.OutOfMemory) return error.OutOfMemory;
-            break :decode_loop;
-        };
-        if (status == .finished) break;
-    }
-    const output = dictionary.buf.items;
+    const output = compression.decode(allocator, wrapper, output_limit) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return null;
+    };
+    defer allocator.free(output);
     if (output.len < decoder.block_size) return null;
     var offset: usize = 0;
     while (offset + decoder.block_size <= output.len) : (offset += decoder.block_size) {
@@ -309,12 +282,10 @@ pub fn decode(
     var cursor: usize = 0;
     while (std.mem.indexOfPos(u8, section, cursor, wrapper_magic)) |candidate| {
         cursor = candidate + 1;
-        if (candidate + wrapper_size + 5 > section.len) continue;
-        const source_start = candidate + wrapper_size - 1;
-        const source_end = @min(section.len, source_start + input_limit);
+        if (candidate == 0 or candidate + wrapper_size + 4 > section.len) continue;
         if (try decodeCandidate(
             allocator,
-            section[source_start..source_end],
+            section[candidate - 1 ..],
             table,
         )) |decoded| return decoded;
     }

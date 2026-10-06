@@ -4,6 +4,7 @@ const std = @import("std");
 const coff = std.coff;
 const imports = @import("imports.zig");
 const recipe = @import("recipe.zig");
+const compression = @import("compression.zig");
 
 const BOOL = i32;
 const DWORD = u32;
@@ -41,9 +42,6 @@ const FindDataW = extern struct {
     alternate_filename: [14]u16,
 };
 
-const LZMA_CONTAINER_MAGIC: u32 = 0x575757F8;
-const LZMA_WRAPPER_SIZE: usize = 16;
-const LZMA_DICTIONARY_SIZE: usize = 1 << 26;
 const IMPORT_ORDINAL_FLAG: u64 = @as(u64, 1) << 63;
 const IMPORT_INVALID_RUN_LIMIT: usize = 64;
 const IMPORT_SCORE_SLOTS: usize = 2048;
@@ -309,36 +307,21 @@ fn decryptText(base: usize, code: ProtectedCode, preserved_address: usize, prese
 }
 
 // compressed sections
-fn decompressSection(base: usize, rva: u32, raw_size: u32, virtual_size: u32) bool {
-    if (raw_size <= LZMA_WRAPPER_SIZE + 5 or virtual_size == 0 or virtual_size > LZMA_DICTIONARY_SIZE) return false;
-
-    const source: [*]const u8 = @ptrFromInt(base + rva + LZMA_WRAPPER_SIZE);
-    const source_size: usize = raw_size - LZMA_WRAPPER_SIZE;
-    var input = std.Io.Reader.fixed(source[0..source_size]);
-
+fn decompressSection(base: usize, rva: u32, raw_size: u32, virtual_size: u32, file_alignment: u32) bool {
+    const source: []const u8 = @as([*]const u8, @ptrFromInt(base + rva))[0..raw_size];
     const allocator = std.heap.page_allocator;
-    var range_decoder = std.compress.lzma.RangeDecoder.init(&input) catch return false;
-    var decoder = std.compress.lzma.Decode.init(allocator, .{ .lc = 3, .lp = 0, .pb = 2 }) catch return false;
-    defer decoder.deinit(allocator);
-    var dictionary = std.compress.lzma.Decode.CircularBuffer.init(LZMA_DICTIONARY_SIZE, LZMA_DICTIONARY_SIZE);
-    defer dictionary.deinit(allocator);
-    var sink: std.Io.Writer.Allocating = .init(allocator);
-    defer sink.deinit();
-
-    // fixed-size raw LZMA tail
-    while (dictionary.len < virtual_size) {
-        var consumed: u64 = 0;
-        const status = decoder.process(&input, &sink, &dictionary, &range_decoder, &consumed) catch return false;
-        if (status == .finished and dictionary.len < virtual_size) return false;
-    }
-    if (dictionary.buf.items.len < virtual_size) return false;
-
+    const limit = std.mem.alignForward(usize, virtual_size, file_alignment);
+    const output = compression.decode(allocator, source, limit) catch return false;
+    defer allocator.free(output);
     const destination = base + rva;
+    const restored_size = @max(output.len, virtual_size);
     var old_protect: DWORD = 0;
-    if (VirtualProtect(@ptrFromInt(destination), virtual_size, PAGE_EXECUTE_READWRITE, &old_protect) == 0) return false;
-    @memcpy(@as([*]u8, @ptrFromInt(destination))[0..virtual_size], dictionary.buf.items[0..virtual_size]);
+    if (VirtualProtect(@ptrFromInt(destination), restored_size, PAGE_EXECUTE_READWRITE, &old_protect) == 0) return false;
+    const bytes = @as([*]u8, @ptrFromInt(destination))[0..restored_size];
+    @memcpy(bytes[0..output.len], output);
+    @memset(bytes[output.len..], 0);
     var ignored: DWORD = 0;
-    _ = VirtualProtect(@ptrFromInt(destination), virtual_size, old_protect, &ignored);
+    _ = VirtualProtect(@ptrFromInt(destination), restored_size, old_protect, &ignored);
     return true;
 }
 
@@ -348,12 +331,14 @@ fn restoreSections(base: usize) bool {
     const optional_size = rd16(pe + 0x14);
     const sections: [*]align(1) const coff.SectionHeader = @ptrFromInt(pe + 0x18 + optional_size);
 
+    const file_alignment = rd32(pe + 0x3c);
+
     for (sections[0..section_count]) |section| {
         const virtual_size = section.virtual_size;
         const rva = section.virtual_address;
         const raw_size = section.size_of_raw_data;
-        if (raw_size < LZMA_WRAPPER_SIZE or rd32(base + rva) != LZMA_CONTAINER_MAGIC) continue;
-        if (!decompressSection(base, rva, raw_size, virtual_size)) return false;
+        if (raw_size < compression.header_size or rd32(base + rva) != 0x575757f8) continue;
+        if (!decompressSection(base, rva, raw_size, virtual_size, file_alignment)) return false;
     }
     return true;
 }
