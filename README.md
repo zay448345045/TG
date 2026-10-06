@@ -18,9 +18,10 @@ To undo the replacement, remove the copied DLL and restore the backup.
 
 - The game must import its Base DLL by ordinal 1. TPGate does not include a launcher or injector.
 - The game's imported `*Base.dll` is TPShell; TPGate replaces it.
-- TPGate reconstructs the protected code, compressed sections, and imports, then runs the original entry point.
-- `ACE-Base64.dll` loads are blocked through restored `LoadLibrary*` imports, not through every possible load path.
-- Reconstruction has been tested with Silver Palace 0.10.82.1, Neverness to Everness, and Wuthering Waves. Other clients and builds are unverified.
+- TPGate reconstructs the executable's protected code and compressed sections, restores imports from TPShell's recipe, then runs the original entry point.
+- It redirects `LoadLibrary*`, `GetProcAddress`, and `FreeLibrary` imports in loaded DLLs and restores TPShell native fragments there, including in DLLs loaded later.
+- `ACE-Base64.dll` loads through the redirected `LoadLibrary*` functions are blocked.
+- Reconstruction has been tested with Silver Palace, Neverness to Everness, Wuthering Waves, and Arknights: Endfield. Other clients and builds are unverified.
 
 ## Building
 
