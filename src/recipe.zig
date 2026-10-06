@@ -168,6 +168,19 @@ fn decodeAt(
             break;
         }
     }
+    if (header_dwords == null) {
+        const prefix_words: usize = 5;
+        const full_header = prefix_words + table.slots.len;
+        const first_record_blocks = (full_header + fields_per_record + decoder.lane_count - 1) / decoder.lane_count;
+        if (recipe_offset + first_record_blocks * decoder.block_size > output.len or
+            logicalWord(output, recipe_offset, prefix_words - 1) != table.slots.len) return null;
+        for (table.slots, 0..) |slot, index| {
+            if (logicalWord(output, recipe_offset, prefix_words + index) != slot.rva) return null;
+        }
+        const first = recordAt(output, recipe_offset, full_header);
+        if (first.slot_rva != table.slots[0].rva or first.ordinal != table.slots[0].ordinal) return null;
+        header_dwords = full_header;
+    }
     const header_count = header_dwords orelse return null;
     const word_count = std.math.add(
         usize,
@@ -290,4 +303,65 @@ pub fn decode(
         )) |decoded| return decoded;
     }
     return error.RecipeNotFound;
+}
+
+test "suffix and full slot headers across recipe blocks" {
+    const Encoder = struct {
+        fn put(output: []u8, index: usize, value: u32) void {
+            const start = index / decoder.lane_count * decoder.block_size;
+            const block: *[decoder.block_size]u8 = @ptrCast(output[start..][0..decoder.block_size]);
+            const lane: u6 = @intCast(index % decoder.lane_count);
+            const original = decoder.decodeLane(block, lane);
+            var offset: usize = 0;
+            while (offset < decoder.block_size) : (offset += 4) {
+                const word = block[offset..][0..4];
+                const saved = std.mem.readInt(u32, word, .little);
+                std.mem.writeInt(u32, word, saved ^ 1, .little);
+                const changed = decoder.decodeLane(block, lane) != original;
+                std.mem.writeInt(u32, word, saved, .little);
+                if (changed) break;
+            }
+            const word = block[offset..][0..4];
+            std.mem.writeInt(u32, word, 0, .little);
+            // xor and wrapping addition preserve dependence on lower bits
+            for (0..32) |bit| {
+                const mask = @as(u32, 1) << @as(u5, @intCast(bit));
+                if ((decoder.decodeLane(block, lane) ^ value) & mask != 0) {
+                    std.mem.writeInt(u32, word, std.mem.readInt(u32, word, .little) ^ mask, .little);
+                }
+            }
+        }
+    };
+    var slots: [74]Slot = undefined;
+    for (&slots, 0..) |*slot, index| slot.* = .{
+        .rva = 0x1000 + @as(u32, @intCast(index * 8)),
+        .ordinal = if (index == slots.len - 1) 1 else 0,
+    };
+    const table: Table = .{ .slots = &slots, .groups = 1 };
+    for ([_]usize{ 37, 5 + slots.len }) |header| {
+        var output: [11 * decoder.block_size]u8 = @splat(0);
+        if (header < decoder.lane_count) {
+            for (0..header) |index| Encoder.put(&output, index, slots[slots.len - header + index].rva);
+        } else {
+            for (0..4) |index| Encoder.put(&output, index, 0xaabbccdd);
+            Encoder.put(&output, 4, slots.len);
+            for (slots, 0..) |slot, index| Encoder.put(&output, 5 + index, slot.rva);
+        }
+        for (slots, 0..) |slot, index| {
+            const record_words = [_]u32{ @intCast(index + 1), 0, slot.ordinal, slot.rva, 11, 0, 77, 14 };
+            for (record_words, 0..) |word, field| Encoder.put(&output, header + index * fields_per_record + field, word);
+        }
+        var decoded = (try decodeAt(std.testing.allocator, &output, 0, table)).?;
+        defer decoded.deinit(std.testing.allocator);
+        try std.testing.expectEqual(slots.len, decoded.records.len);
+        for (decoded.records, slots, 0..) |record, slot, index| {
+            try std.testing.expectEqual(@as(u64, index + 1), record.name_hash);
+            try std.testing.expectEqual(slot.rva, record.slot_rva);
+            try std.testing.expectEqual(slot.ordinal, record.ordinal);
+        }
+        if (header >= decoder.lane_count) {
+            Encoder.put(&output, 4, slots.len - 1);
+            try std.testing.expectEqual(@as(?Decoded, null), try decodeAt(std.testing.allocator, &output, 0, table));
+        }
+    }
 }
