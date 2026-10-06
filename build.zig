@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Build optimization mode") orelse .ReleaseSmall;
+    const optimize = b.option(std.builtin.Optimize, "optimize", "Build optimization mode") orelse .small;
     const target = b.standardTargetOptions(.{
         .default_target = .{
             .cpu_arch = .x86_64,

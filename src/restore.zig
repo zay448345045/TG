@@ -160,8 +160,7 @@ test "two padding words at the end of a cipher block" {
     const padding_rva: u32 = 510 * 8;
     var image: [512 * 8]u8 = @splat(0);
     for (0..2) |index| {
-        std.mem.writeInt(u64, image[padding_rva + index * 8 ..][0..8],
-            (seed +% step *% (510 + index)) ^ 0xcccccccccccccccc, .little);
+        std.mem.writeInt(u64, image[padding_rva + index * 8 ..][0..8], (seed +% step *% (510 + index)) ^ 0xcccccccccccccccc, .little);
     }
     const key = textKeyFromPadding(@intFromPtr(&image), .{ .rva = 0, .virtual_size = image.len }, padding_rva, 0xcc).?;
     try std.testing.expectEqual(seed, key.seed);
