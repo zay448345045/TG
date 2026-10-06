@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const coff = std.coff;
-const imports = @import("imports.zig");
+const hooks = @import("hooks.zig");
 const recipe = @import("recipe.zig");
 const compression = @import("compression.zig");
 
@@ -662,12 +662,12 @@ fn rangeInImage(rva: u32, size: usize, image_size: u32) bool {
 }
 
 fn resolveNamed(module: HMODULE, wanted_hash: u64) ?*anyopaque {
-    if (wanted_hash == combinedHashAscii("LoadLibraryA")) return @ptrFromInt(@intFromPtr(&imports.loadLibraryA));
-    if (wanted_hash == combinedHashAscii("LoadLibraryW")) return @ptrFromInt(@intFromPtr(&imports.loadLibraryW));
-    if (wanted_hash == combinedHashAscii("LoadLibraryExA")) return @ptrFromInt(@intFromPtr(&imports.loadLibraryExA));
-    if (wanted_hash == combinedHashAscii("LoadLibraryExW")) return @ptrFromInt(@intFromPtr(&imports.loadLibraryExW));
-    if (wanted_hash == combinedHashAscii("GetProcAddress")) return @ptrFromInt(@intFromPtr(&imports.getProcAddress));
-    if (wanted_hash == combinedHashAscii("FreeLibrary")) return @ptrFromInt(@intFromPtr(&imports.freeLibrary));
+    if (wanted_hash == combinedHashAscii("LoadLibraryA")) return @ptrFromInt(@intFromPtr(&hooks.loadLibraryA));
+    if (wanted_hash == combinedHashAscii("LoadLibraryW")) return @ptrFromInt(@intFromPtr(&hooks.loadLibraryW));
+    if (wanted_hash == combinedHashAscii("LoadLibraryExA")) return @ptrFromInt(@intFromPtr(&hooks.loadLibraryExA));
+    if (wanted_hash == combinedHashAscii("LoadLibraryExW")) return @ptrFromInt(@intFromPtr(&hooks.loadLibraryExW));
+    if (wanted_hash == combinedHashAscii("GetProcAddress")) return @ptrFromInt(@intFromPtr(&hooks.getProcAddress));
+    if (wanted_hash == combinedHashAscii("FreeLibrary")) return @ptrFromInt(@intFromPtr(&hooks.freeLibrary));
     if (wanted_hash == combinedHashAscii("??4?$_Iosb@H@std@@QEAAAEAV01@$$QEAV01@@Z")) {
         return @ptrFromInt(@intFromPtr(&iosbAssignIdentity));
     }
@@ -863,7 +863,7 @@ pub fn disableTlsCallbacks() bool {
 }
 
 pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usize) ?usize {
-    imports.initialize(self_module);
+    hooks.initialize(self_module);
     const base = @intFromPtr(GetModuleHandleW(null));
     if (base == 0) return null;
 
@@ -872,5 +872,6 @@ pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usi
     if (!restoreSections(base)) return null;
 
     const original_entry = restoreImports(base, code) orelse return null;
+    if (!hooks.patchLoaded()) return null;
     return base + original_entry;
 }
