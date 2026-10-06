@@ -1,6 +1,6 @@
 .{
     .name = .tpgate,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .minimum_zig_version = "0.17.0",
     .paths = .{""},
     .fingerprint = 0x41cc49339d434634,
