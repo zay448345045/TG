@@ -123,14 +123,12 @@ fn findProtectedCode(base: usize) ?ProtectedCode {
 
 fn textKeyFromPadding(base: usize, code: ProtectedCode, padding_rva: u32, byte: u8) ?TextKey {
     const word_index = @as(u64, padding_rva - code.rva) / 8;
-    if ((word_index & 511) > 509) return null;
+    if ((word_index & 511) > 510) return null;
 
     const padding = @as(u64, byte) * 0x0101010101010101;
     const first = rd64(base + padding_rva) ^ padding;
     const second = rd64(base + padding_rva + 8) ^ padding;
     const step = second -% first;
-    if (rd64(base + padding_rva + 16) ^ padding != first +% (step *% 2)) return null;
-
     return .{
         .seed = first -% (step *% ((word_index & 511) + 4096 * (word_index >> 9))),
         .step = step,
@@ -158,7 +156,62 @@ test "recover text key across cipher blocks" {
     try std.testing.expectEqual(step, key.step);
 }
 
-fn findTextKey(base: usize, code: ProtectedCode) ?TextKey {
+test "two padding words at the end of a cipher block" {
+    const seed: u64 = 0x46173b4ae4ee35ce;
+    const step: u64 = 0x4f6007dcdf78975a;
+    const padding_rva: u32 = 510 * 8;
+    var image: [512 * 8]u8 = @splat(0);
+    for (0..2) |index| {
+        std.mem.writeInt(u64, image[padding_rva + index * 8 ..][0..8],
+            (seed +% step *% (510 + index)) ^ 0xcccccccccccccccc, .little);
+    }
+    const key = textKeyFromPadding(@intFromPtr(&image), .{ .rva = 0, .virtual_size = image.len }, padding_rva, 0xcc).?;
+    try std.testing.expectEqual(seed, key.seed);
+    try std.testing.expectEqual(step, key.step);
+}
+
+test "protected code uses unwind coverage and short padding inside gaps" {
+    var image: [0x9000]u8 = @splat(0);
+    std.mem.writeInt(u16, image[0..2], 0x5a4d, .little);
+    std.mem.writeInt(u32, image[0x3c..0x40], 0x80, .little);
+    std.mem.writeInt(u32, image[0x80..0x84], 0x4550, .little);
+    std.mem.writeInt(u16, image[0x86..0x88], 2, .little);
+    std.mem.writeInt(u16, image[0x94..0x96], 0xf0, .little);
+    std.mem.writeInt(u32, image[0xd0..0xd4], image.len, .little);
+    std.mem.writeInt(u32, image[0x120..0x124], 0x8000, .little);
+    std.mem.writeInt(u32, image[0x124..0x128], 36, .little);
+    const sections: *align(1) [2]coff.SectionHeader = @ptrCast(image[0x188..][0..80]);
+    sections[0].virtual_address = 0x1000;
+    sections[0].virtual_size = 0x2000;
+    sections[0].flags.CNT_CODE = true;
+    sections[0].flags.MEM_EXECUTE = true;
+    sections[1].virtual_address = 0x4000;
+    sections[1].virtual_size = 0x4000;
+    sections[1].flags.CNT_CODE = true;
+    sections[1].flags.MEM_EXECUTE = true;
+    for ([_][2]u32{ .{ 0x1000, 0x1018 }, .{ 0x1040, 0x1060 }, .{ 0x2030, 0x2040 } }, 0..) |entry, index| {
+        std.mem.writeInt(u32, image[0x8000 + index * 12 ..][0..4], entry[0], .little);
+        std.mem.writeInt(u32, image[0x8004 + index * 12 ..][0..4], entry[1], .little);
+    }
+    var random: std.Random.DefaultPrng = .init(0);
+    random.random().bytes(image[0x1000..0x3000]);
+    @memset(image[0x1028..0x1038], 0xcc);
+    @memset(image[0x2018..0x2028], 0xcc);
+    const seed: u64 = 0x46173b4ae4ee35ce;
+    const step: u64 = 0x4f6007dcdf78975a;
+    for (0..0x2000 / 8) |index| {
+        const word = image[0x1000 + index * 8 ..][0..8];
+        const pad = seed +% step *% ((index & 511) + 4096 * (index >> 9));
+        std.mem.writeInt(u64, word, std.mem.readInt(u64, word, .little) ^ pad, .little);
+    }
+    const code = findProtectedCode(@intFromPtr(&image)).?;
+    try std.testing.expectEqual(@as(u32, 0x1000), code.rva);
+    const key = findTextKey(@intFromPtr(&image), code).?;
+    try std.testing.expectEqual(seed, key.seed);
+    try std.testing.expectEqual(step, key.step);
+}
+
+fn scanTextKey(base: usize, code: ProtectedCode, corroborate_word: bool) ?TextKey {
     const pe = base + rd32(base + 0x3c);
     const optional = pe + 0x18;
     const image_size = rd32(optional + 0x38);
@@ -167,7 +220,8 @@ fn findTextKey(base: usize, code: ProtectedCode) ?TextKey {
     if (!rangeInImage(exception_rva, exception_size, image_size)) return null;
 
     var previous_end: ?u32 = null;
-    var candidate: ?TextKey = null;
+    var candidates: std.AutoHashMap(TextKey, void) = .init(std.heap.page_allocator);
+    defer candidates.deinit();
     for (0..exception_size / 12) |index| {
         const entry = base + exception_rva + index * 12;
         const begin = rd32(entry);
@@ -176,19 +230,28 @@ fn findTextKey(base: usize, code: ProtectedCode) ?TextKey {
             @as(u64, end) > @as(u64, code.rva) + code.virtual_size) continue;
 
         if (previous_end) |last_end| {
-            const padding_rva = (last_end + 7) & ~@as(u32, 7);
-            if (@as(u64, padding_rva) + 24 <= begin) {
+            var padding_rva = (last_end + 7) & ~@as(u32, 7);
+            const sample_size: u32 = if (corroborate_word) 24 else 16;
+            while (@as(u64, padding_rva) + sample_size <= begin) : (padding_rva += 8) {
                 for ([_]u8{ 0xcc, 0x90, 0 }) |byte| {
                     const key = textKeyFromPadding(base, code, padding_rva, byte) orelse continue;
-                    if (candidate) |prior| {
-                        if (prior.seed == key.seed and prior.step == key.step) return key;
-                    } else candidate = key;
+                    if (corroborate_word) {
+                        const pad = @as(u64, byte) * 0x0101010101010101;
+                        const first = rd64(base + padding_rva) ^ pad;
+                        if (rd64(base + padding_rva + 16) ^ pad != first +% key.step *% 2) continue;
+                    }
+                    const candidate = candidates.getOrPut(key) catch return null;
+                    if (candidate.found_existing) return key;
                 }
             }
         }
         previous_end = end;
     }
     return null;
+}
+
+fn findTextKey(base: usize, code: ProtectedCode) ?TextKey {
+    return scanTextKey(base, code, true) orelse scanTextKey(base, code, false);
 }
 
 fn decryptText(base: usize, code: ProtectedCode, preserved_address: usize, preserved_size: usize) bool {
