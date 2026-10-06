@@ -90,13 +90,28 @@ fn findProtectedCode(base: usize) ?ProtectedCode {
     const section_count = rd16(pe + 6);
     const optional_size = rd16(pe + 0x14);
     const sections: [*]align(1) const coff.SectionHeader = @ptrFromInt(pe + 0x18 + optional_size);
+    const optional = pe + 0x18;
+    const image_size = rd32(optional + 0x38);
+    const exception_rva = rd32(optional + 0x70 + 3 * 8);
+    const exception_size = rd32(optional + 0x70 + 3 * 8 + 4);
+    if (!rangeInImage(exception_rva, exception_size, image_size)) return null;
 
     var result: ?ProtectedCode = null;
+    var most_functions: usize = 0;
     for (sections[0..section_count]) |section| {
         const virtual_size = section.virtual_size;
         const is_executable_code = section.flags.CNT_CODE and section.flags.MEM_EXECUTE;
         if (!is_executable_code) continue;
-        if (result == null or virtual_size > result.?.virtual_size) {
+        var functions: usize = 0;
+        for (0..exception_size / 12) |index| {
+            const entry = base + exception_rva + index * 12;
+            const begin = rd32(entry);
+            const end = rd32(entry + 4);
+            if (begin >= section.virtual_address and begin < end and
+                @as(u64, end) <= @as(u64, section.virtual_address) + virtual_size) functions += 1;
+        }
+        if (functions > most_functions) {
+            most_functions = functions;
             result = .{
                 .rva = section.virtual_address,
                 .virtual_size = virtual_size,
