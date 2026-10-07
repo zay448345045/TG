@@ -21,7 +21,7 @@ To undo the replacement, remove the copied DLL and restore the backup.
 - TPGate reconstructs the executable's protected code and compressed sections, restores imports from TPShell's recipe, then runs the original entry point.
 - It redirects `LoadLibrary*`, `GetProcAddress`, and `FreeLibrary` imports in loaded DLLs and restores TPShell native fragments there, including in DLLs loaded later.
 - `ACE-Base64.dll` loads through the redirected `LoadLibrary*` functions are blocked.
-- Reconstruction has been tested with Silver Palace, Neverness to Everness, Wuthering Waves, and Arknights: Endfield. Other clients and builds are unverified.
+- Reconstruction has been tested with Silver Palace, Neverness to Everness, Wuthering Waves, Arknights: Endfield, and Punishing: Gray Raven. Other clients and builds are unverified.
 
 ## Building
 
