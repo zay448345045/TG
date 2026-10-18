@@ -172,32 +172,32 @@ test "ACE load matching" {
 }
 
 pub fn loadLibraryA(name: [*:0]const u8) callconv(.winapi) HMODULE {
-    if (isBlockedAscii(std.mem.span(name), blocked)) return self;
+    if (blocked.len != 0 and isBlockedAscii(std.mem.span(name), blocked)) return self;
     return patchDependencies(LoadLibraryA(name));
 }
 
 pub fn loadLibraryW(name: [*:0]const u16) callconv(.winapi) HMODULE {
-    if (isBlockedWide(std.mem.span(name), blocked)) return self;
+    if (blocked.len != 0 and isBlockedWide(std.mem.span(name), blocked)) return self;
     return patchDependencies(LoadLibraryW(name));
 }
 
 pub fn loadLibraryExA(name: [*:0]const u8, file: HANDLE, flags: DWORD) callconv(.winapi) HMODULE {
-    if (isBlockedAscii(std.mem.span(name), blocked)) return self;
+    if (blocked.len != 0 and isBlockedAscii(std.mem.span(name), blocked)) return self;
     return patchDependencies(LoadLibraryExA(name, file, flags));
 }
 
 pub fn loadLibraryExW(name: [*:0]const u16, file: HANDLE, flags: DWORD) callconv(.winapi) HMODULE {
-    if (isBlockedWide(std.mem.span(name), blocked)) return self;
+    if (blocked.len != 0 and isBlockedWide(std.mem.span(name), blocked)) return self;
     return patchDependencies(LoadLibraryExW(name, file, flags));
 }
 
 pub fn getProcAddress(module: HMODULE, name: [*:0]const u8) callconv(.winapi) ?*anyopaque {
-    if (module == self) return null;
+    if (blocked.len != 0 and module == self) return null;
     const address = GetProcAddress(module, name) orelse return null;
     return @ptrFromInt(redirect(@intFromPtr(address)));
 }
 
 pub fn freeLibrary(module: HMODULE) callconv(.winapi) BOOL {
-    if (module == self) return 1;
+    if (blocked.len != 0 and module == self) return 1;
     return FreeLibrary(module);
 }
