@@ -5,6 +5,7 @@ const coff = std.coff;
 const hooks = @import("hooks.zig");
 const recipe = @import("recipe.zig");
 const compression = @import("compression.zig");
+const build_options = @import("build_options");
 
 const BOOL = i32;
 const DWORD = u32;
@@ -363,6 +364,7 @@ fn decryptText(base: usize, code: ProtectedCode, preserved_address: usize, prese
     const text = base + code.rva;
     const bytes: [*]u8 = @ptrFromInt(text);
     if (mode == .tp6 and hasPlainPadding(base, code)) {
+        if (comptime build_options.dump_text) @import("dumps.zig").writeFile("decrypted_text.bin", bytes[0..code.virtual_size]);
         return;
     }
     const key = (try findTextKey(base, code)) orelse return error.TextKeyNotFound;
@@ -418,9 +420,18 @@ fn decryptText(base: usize, code: ProtectedCode, preserved_address: usize, prese
     if (VirtualProtect(@ptrFromInt(text), code.virtual_size, old_protect, &ignored) == 0) {
         std.log.warn("text protection restore failed: Win32 {d}", .{GetLastError()});
     }
+    if (comptime build_options.dump_text) @import("dumps.zig").writeFile("decrypted_text.bin", bytes[0..code.virtual_size]);
 }
 
 // compressed sections
+fn dumpSection(rva: u32, output: []const u8) void {
+    if (comptime build_options.dump_sections) {
+        var name_buffer: [32]u8 = undefined;
+        const name = std.fmt.bufPrintSentinel(&name_buffer, "section-0x{x}.bin", .{rva}, 0) catch unreachable;
+        @import("dumps.zig").writeFile(name, output);
+    }
+}
+
 fn decompressSection(base: usize, rva: u32, raw_size: u32, virtual_size: u32, file_alignment: u32) !void {
     const source: []const u8 = @as([*]const u8, @ptrFromInt(base + rva))[0..raw_size];
     const allocator = std.heap.page_allocator;
@@ -444,6 +455,7 @@ fn decompressSection(base: usize, rva: u32, raw_size: u32, virtual_size: u32, fi
     if (VirtualProtect(@ptrFromInt(destination), restored_size, old_protect, &ignored) == 0) {
         std.log.warn("section 0x{x} protection restore failed: Win32 {d}", .{ rva, GetLastError() });
     }
+    dumpSection(rva, output);
 }
 
 fn restoreSections(base: usize, mode: Mode) !void {
@@ -500,6 +512,7 @@ fn restoreSections(base: usize, mode: Mode) !void {
             if (VirtualProtect(destination, output.len, old_protect, &ignored) == 0) {
                 std.log.warn("TP6 section 0x{x} protection restore failed: Win32 {d}", .{ section.virtual_address, GetLastError() });
             }
+            dumpSection(section.virtual_address, output);
             restored = true;
             break;
         }
@@ -986,11 +999,31 @@ fn restoreImports(base: usize, mode: Mode) !void {
     };
     defer decoded.deinit(allocator);
 
+    var dump_records: ?[]@import("dumps.zig").Import = null;
+    if (comptime build_options.dump_imports) {
+        dump_records = allocator.alloc(@import("dumps.zig").Import, decoded.records.len) catch blk: {
+            std.log.warn("imports dump allocation failed", .{});
+            break :blk null;
+        };
+    }
+    defer if (dump_records) |records| allocator.free(records);
+    if (dump_records) |records| {
+        for (decoded.records, records) |record, *saved| {
+            saved.* = .{
+                .module_hash = record.module_hash,
+                .slot_rva = record.slot_rva,
+                .ordinal = record.ordinal,
+                .name_hash = record.name_hash,
+            };
+        }
+    }
+    defer if (dump_records) |records| @import("dumps.zig").writeImports(records);
+
     const cache = try allocator.alloc(ModuleCache, decoded.module_runs);
     defer allocator.free(cache);
     var cache_count: usize = 0;
 
-    for (decoded.records) |record| {
+    for (decoded.records, 0..) |record, index| {
         var module: HMODULE = null;
         for (cache[0..cache_count]) |cached| {
             if (cached.hash == record.module_hash) {
@@ -1021,12 +1054,14 @@ fn restoreImports(base: usize, mode: Mode) !void {
                 std.log.err("import name hash 0x{x} missing in module 0x{x} at slot 0x{x}", .{ record.name_hash, record.module_hash, record.slot_rva });
                 return error.ImportNameNotFound;
             };
+            if (dump_records) |records| records[index].name = named.name;
             address = named.ptr orelse {
                 std.log.err("import {s} has no address at slot 0x{x}", .{ std.mem.span(named.name), record.slot_rva });
                 return error.ImportAddressNotFound;
             };
         }
         try writeImport(base, record.slot_rva, @intFromPtr(address));
+        if (dump_records) |records| records[index].address = @intFromPtr(address);
     }
 }
 

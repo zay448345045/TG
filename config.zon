@@ -1,0 +1,8 @@
+.{
+    // Write selected dumps to working directory
+    .dumps = .{
+        .text = false,
+        .sections = false,
+        .imports = false,
+    },
+}
