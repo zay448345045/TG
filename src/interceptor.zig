@@ -33,5 +33,5 @@ pub fn write(address: usize, bytes: []const u8) ReplaceError!void {
     std.process.protectMemory(
         pages,
         .{ .read = true, .write = false, .execute = true },
-    ) catch return;
+    ) catch |err| std.log.warn("entry protection restore failed: {s}", .{@errorName(err)});
 }

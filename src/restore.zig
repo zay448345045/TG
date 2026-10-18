@@ -22,6 +22,7 @@ extern "kernel32" fn FindFirstFileW(name: [*:0]const u16, data: *FindDataW) call
 extern "kernel32" fn FindNextFileW(handle: HANDLE, data: *FindDataW) callconv(.winapi) BOOL;
 extern "kernel32" fn FindClose(handle: HANDLE) callconv(.winapi) BOOL;
 extern "kernel32" fn VirtualProtect(address: ?*anyopaque, size: usize, new_protect: DWORD, old_protect: *DWORD) callconv(.winapi) BOOL;
+extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 
 const PAGE_EXECUTE_READWRITE: DWORD = 0x40;
 const PAGE_READWRITE: DWORD = 0x04;
@@ -205,7 +206,7 @@ test "protected code uses unwind coverage and short padding inside gaps" {
     }
     const code = findProtectedCode(@intFromPtr(&image)).?;
     try std.testing.expectEqual(@as(u32, 0x1000), code.rva);
-    const key = findTextKey(@intFromPtr(&image), code).?;
+    const key = (try findTextKey(@intFromPtr(&image), code)).?;
     try std.testing.expectEqual(seed, key.seed);
     try std.testing.expectEqual(step, key.step);
 }
@@ -246,8 +247,8 @@ test "recover text key from sparse padding" {
         std.mem.writeInt(u64, word, std.mem.readInt(u64, word, .little) ^ pad, .little);
     }
     const code = findProtectedCode(@intFromPtr(&image)).?;
-    try std.testing.expect(scanTextKey(@intFromPtr(&image), code, true) == null);
-    const key = findTextKey(@intFromPtr(&image), code).?;
+    try std.testing.expect((try scanTextKey(@intFromPtr(&image), code, true)) == null);
+    const key = (try findTextKey(@intFromPtr(&image), code)).?;
     try std.testing.expectEqual(seed, key.seed);
     try std.testing.expectEqual(step, key.step);
 }
@@ -280,7 +281,7 @@ fn corroborateSparseTextKey(base: usize, code: ProtectedCode, key: TextKey, cand
     return false;
 }
 
-fn scanTextKey(base: usize, code: ProtectedCode, corroborate_word: bool) ?TextKey {
+fn scanTextKey(base: usize, code: ProtectedCode, corroborate_word: bool) error{OutOfMemory}!?TextKey {
     const pe = base + rd32(base + 0x3c);
     const optional = pe + 0x18;
     const image_size = rd32(optional + 0x38);
@@ -313,7 +314,7 @@ fn scanTextKey(base: usize, code: ProtectedCode, corroborate_word: bool) ?TextKe
                         if (rd64(base + padding_rva + 16) ^ pad != first +% key.step *% 2) continue;
                     }
                     if (!corroborate_word and corroborateSparseTextKey(base, code, key, padding_rva, exception_rva, exception_size)) return key;
-                    const candidate = candidates.getOrPut(key) catch return null;
+                    const candidate = try candidates.getOrPut(key);
                     if (candidate.found_existing) return key;
                 }
             }
@@ -323,8 +324,8 @@ fn scanTextKey(base: usize, code: ProtectedCode, corroborate_word: bool) ?TextKe
     return null;
 }
 
-fn findTextKey(base: usize, code: ProtectedCode) ?TextKey {
-    return scanTextKey(base, code, true) orelse scanTextKey(base, code, false);
+fn findTextKey(base: usize, code: ProtectedCode) error{OutOfMemory}!?TextKey {
+    return (try scanTextKey(base, code, true)) orelse (try scanTextKey(base, code, false));
 }
 
 fn hasPlainPadding(base: usize, code: ProtectedCode) bool {
@@ -358,15 +359,20 @@ fn hasPlainPadding(base: usize, code: ProtectedCode) bool {
     return false;
 }
 
-fn decryptText(base: usize, code: ProtectedCode, preserved_address: usize, preserved_size: usize, mode: Mode) bool {
-    if (mode == .tp6 and hasPlainPadding(base, code)) return true;
-    const key = findTextKey(base, code) orelse return false;
+fn decryptText(base: usize, code: ProtectedCode, preserved_address: usize, preserved_size: usize, mode: Mode) !void {
     const text = base + code.rva;
+    const bytes: [*]u8 = @ptrFromInt(text);
+    if (mode == .tp6 and hasPlainPadding(base, code)) {
+        return;
+    }
+    const key = (try findTextKey(base, code)) orelse return error.TextKeyNotFound;
     const e_step = key.step *% 4096;
     var old_protect: DWORD = 0;
-    if (VirtualProtect(@ptrFromInt(text), code.virtual_size, PAGE_EXECUTE_READWRITE, &old_protect) == 0) return false;
+    if (VirtualProtect(@ptrFromInt(text), code.virtual_size, PAGE_EXECUTE_READWRITE, &old_protect) == 0) {
+        std.log.err("text protection failed: Win32 {d}", .{GetLastError()});
+        return error.TextProtectionFailed;
+    }
 
-    const bytes: [*]u8 = @ptrFromInt(text);
     const full_qwords: usize = code.virtual_size / 8;
     var qword_index: usize = 0;
     var block_pad = key.seed;
@@ -409,30 +415,38 @@ fn decryptText(base: usize, code: ProtectedCode, preserved_address: usize, prese
     }
 
     var ignored: DWORD = 0;
-    _ = VirtualProtect(@ptrFromInt(text), code.virtual_size, old_protect, &ignored);
-    return true;
+    if (VirtualProtect(@ptrFromInt(text), code.virtual_size, old_protect, &ignored) == 0) {
+        std.log.warn("text protection restore failed: Win32 {d}", .{GetLastError()});
+    }
 }
 
 // compressed sections
-fn decompressSection(base: usize, rva: u32, raw_size: u32, virtual_size: u32, file_alignment: u32) bool {
+fn decompressSection(base: usize, rva: u32, raw_size: u32, virtual_size: u32, file_alignment: u32) !void {
     const source: []const u8 = @as([*]const u8, @ptrFromInt(base + rva))[0..raw_size];
     const allocator = std.heap.page_allocator;
     const limit = std.mem.alignForward(usize, virtual_size, file_alignment);
-    const output = compression.decode(allocator, source, limit) catch return false;
+    const output = compression.decode(allocator, source, limit) catch |err| {
+        std.log.err("section 0x{x} decode failed: {s}", .{ rva, @errorName(err) });
+        return err;
+    };
     defer allocator.free(output);
     const destination = base + rva;
     const restored_size = @max(output.len, virtual_size);
     var old_protect: DWORD = 0;
-    if (VirtualProtect(@ptrFromInt(destination), restored_size, PAGE_EXECUTE_READWRITE, &old_protect) == 0) return false;
+    if (VirtualProtect(@ptrFromInt(destination), restored_size, PAGE_EXECUTE_READWRITE, &old_protect) == 0) {
+        std.log.err("section 0x{x} protection failed: Win32 {d}", .{ rva, GetLastError() });
+        return error.SectionProtectionFailed;
+    }
     const bytes = @as([*]u8, @ptrFromInt(destination))[0..restored_size];
     @memcpy(bytes[0..output.len], output);
     @memset(bytes[output.len..], 0);
     var ignored: DWORD = 0;
-    _ = VirtualProtect(@ptrFromInt(destination), restored_size, old_protect, &ignored);
-    return true;
+    if (VirtualProtect(@ptrFromInt(destination), restored_size, old_protect, &ignored) == 0) {
+        std.log.warn("section 0x{x} protection restore failed: Win32 {d}", .{ rva, GetLastError() });
+    }
 }
 
-fn restoreSections(base: usize, mode: Mode) bool {
+fn restoreSections(base: usize, mode: Mode) !void {
     const pe = base + rd32(base + 0x3C);
     const section_count = rd16(pe + 6);
     const optional_size = rd16(pe + 0x14);
@@ -445,10 +459,10 @@ fn restoreSections(base: usize, mode: Mode) bool {
         const rva = section.virtual_address;
         const raw_size = section.size_of_raw_data;
         if (raw_size < compression.header_size or rd32(base + rva) != 0x575757f8) continue;
-        if (!decompressSection(base, rva, raw_size, virtual_size, file_alignment)) return false;
+        try decompressSection(base, rva, raw_size, virtual_size, file_alignment);
     }
 
-    if (mode == .std) return true;
+    if (mode == .std) return;
 
     const entry_rva = rd32(pe + 0x28);
     var entry_section: ?[]const u8 = null;
@@ -460,7 +474,7 @@ fn restoreSections(base: usize, mode: Mode) bool {
             break;
         }
     }
-    const entry = entry_section orelse return false;
+    const entry = entry_section orelse return error.EntrySectionNotFound;
     for (sections[0..section_count]) |section| {
         if (section.size_of_raw_data != 0 or section.virtual_size == 0 or
             !std.mem.eql(u8, section.name[0..4], ".tp6")) continue;
@@ -469,21 +483,31 @@ fn restoreSections(base: usize, mode: Mode) bool {
         var restored = false;
         while (std.mem.indexOfPos(u8, entry, cursor, compression.magic)) |candidate| {
             cursor = candidate + 1;
-            const output = compression.decode(std.heap.page_allocator, entry[candidate..], padded_size) catch continue;
+            const output = compression.decode(std.heap.page_allocator, entry[candidate..], padded_size) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                continue;
+            };
             defer std.heap.page_allocator.free(output);
             if (output.len != padded_size) continue;
             var old_protect: DWORD = 0;
             const destination: [*]u8 = @ptrFromInt(base + section.virtual_address);
-            if (VirtualProtect(destination, output.len, PAGE_READWRITE, &old_protect) == 0) return false;
+            if (VirtualProtect(destination, output.len, PAGE_READWRITE, &old_protect) == 0) {
+                std.log.err("TP6 section 0x{x} protection failed: Win32 {d}", .{ section.virtual_address, GetLastError() });
+                return error.SectionProtectionFailed;
+            }
             @memcpy(destination[0..output.len], output);
             var ignored: DWORD = 0;
-            _ = VirtualProtect(destination, output.len, old_protect, &ignored);
+            if (VirtualProtect(destination, output.len, old_protect, &ignored) == 0) {
+                std.log.warn("TP6 section 0x{x} protection restore failed: Win32 {d}", .{ section.virtual_address, GetLastError() });
+            }
             restored = true;
             break;
         }
-        if (!restored) return false;
+        if (!restored) {
+            std.log.err("TP6 section 0x{x} payload not found", .{section.virtual_address});
+            return error.SectionPayloadNotFound;
+        }
     }
-    return true;
 }
 
 // protected imports
@@ -804,27 +828,32 @@ fn rangeInImage(rva: u32, size: usize, image_size: u32) bool {
     return rva < image_size and size <= @as(usize, image_size - rva);
 }
 
-fn resolveNamed(module: HMODULE, wanted_hash: u64) ?*anyopaque {
-    if (wanted_hash == combinedHashAscii("LoadLibraryA")) return @ptrFromInt(@intFromPtr(&hooks.loadLibraryA));
-    if (wanted_hash == combinedHashAscii("LoadLibraryW")) return @ptrFromInt(@intFromPtr(&hooks.loadLibraryW));
-    if (wanted_hash == combinedHashAscii("LoadLibraryExA")) return @ptrFromInt(@intFromPtr(&hooks.loadLibraryExA));
-    if (wanted_hash == combinedHashAscii("LoadLibraryExW")) return @ptrFromInt(@intFromPtr(&hooks.loadLibraryExW));
-    if (wanted_hash == combinedHashAscii("GetProcAddress")) return @ptrFromInt(@intFromPtr(&hooks.getProcAddress));
-    if (wanted_hash == combinedHashAscii("FreeLibrary")) return @ptrFromInt(@intFromPtr(&hooks.freeLibrary));
-    if (wanted_hash == combinedHashAscii("??4?$_Iosb@H@std@@QEAAAEAV01@$$QEAV01@@Z")) {
-        return @ptrFromInt(@intFromPtr(&iosbAssignIdentity));
-    }
+const NamedImport = struct {
+    name: [*:0]const u8,
+    ptr: ?*const anyopaque,
+};
+
+fn resolveNamed(module: HMODULE, wanted_hash: u64) ?NamedImport {
+    if (wanted_hash == combinedHashAscii("LoadLibraryA"))
+        return .{ .name = "LoadLibraryA", .ptr = &hooks.loadLibraryA };
+
+    if (wanted_hash == combinedHashAscii("LoadLibraryW")) return .{ .name = "LoadLibraryW", .ptr = &hooks.loadLibraryW };
+    if (wanted_hash == combinedHashAscii("LoadLibraryExA")) return .{ .name = "LoadLibraryExA", .ptr = &hooks.loadLibraryExA };
+    if (wanted_hash == combinedHashAscii("LoadLibraryExW")) return .{ .name = "LoadLibraryExW", .ptr = &hooks.loadLibraryExW };
+    if (wanted_hash == combinedHashAscii("GetProcAddress")) return .{ .name = "GetProcAddress", .ptr = &hooks.getProcAddress };
+    if (wanted_hash == combinedHashAscii("FreeLibrary")) return .{ .name = "FreeLibrary", .ptr = &hooks.freeLibrary };
+    if (wanted_hash == combinedHashAscii("??4?$_Iosb@H@std@@QEAAAEAV01@$$QEAV01@@Z")) return .{ .name = "??4?$_Iosb@H@std@@QEAAAEAV01@$$QEAV01@@Z", .ptr = &iosbAssignIdentity };
     if (wanted_hash == combinedHashAscii("NtdllDefWindowProc_A")) {
         const user32 = LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("user32.dll")) orelse return null;
-        return GetProcAddress(user32, "DefWindowProcA");
+        return .{ .name = "NtdllDefWindowProc_A", .ptr = GetProcAddress(user32, "DefWindowProcA") };
     }
     if (wanted_hash == combinedHashAscii("NtdllDefWindowProc_W")) {
         const user32 = LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("user32.dll")) orelse return null;
-        return GetProcAddress(user32, "DefWindowProcW");
+        return .{ .name = "NtdllDefWindowProc_W", .ptr = GetProcAddress(user32, "DefWindowProcW") };
     }
     if (wanted_hash == combinedHashAscii("RtlGetCurrentProcessorNumber")) {
         const ntdll = LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("ntdll.dll")) orelse return null;
-        return GetProcAddress(ntdll, "NtGetCurrentProcessorNumber");
+        return .{ .name = "RtlGetCurrentProcessorNumber", .ptr = GetProcAddress(ntdll, "NtGetCurrentProcessorNumber") };
     }
 
     const module_base = @intFromPtr(module);
@@ -852,19 +881,23 @@ fn resolveNamed(module: HMODULE, wanted_hash: u64) ?*anyopaque {
         const length = std.mem.indexOfScalar(u8, bytes[0..maximum], 0) orelse continue;
         if (combinedHashAscii(bytes[0..length]) != wanted_hash) continue;
         const name: [*:0]const u8 = @ptrCast(bytes);
-        return GetProcAddress(module, name);
+        return .{ .name = name, .ptr = GetProcAddress(module, name) };
     }
     return null;
 }
 
-fn writeImport(base: usize, target_rva: u32, address: usize) bool {
+fn writeImport(base: usize, target_rva: u32, address: usize) !void {
     const target = base + target_rva;
     var old_protect: DWORD = 0;
-    if (VirtualProtect(@ptrFromInt(target), @sizeOf(usize), PAGE_READWRITE, &old_protect) == 0) return false;
+    if (VirtualProtect(@ptrFromInt(target), @sizeOf(usize), PAGE_READWRITE, &old_protect) == 0) {
+        std.log.err("import slot 0x{x} protection failed: Win32 {d}", .{ target_rva, GetLastError() });
+        return error.ImportProtectionFailed;
+    }
     @as(*align(1) usize, @ptrFromInt(target)).* = address;
     var ignored: DWORD = 0;
-    _ = VirtualProtect(@ptrFromInt(target), @sizeOf(usize), old_protect, &ignored);
-    return true;
+    if (VirtualProtect(@ptrFromInt(target), @sizeOf(usize), old_protect, &ignored) == 0) {
+        std.log.warn("import slot 0x{x} protection restore failed: Win32 {d}", .{ target_rva, GetLastError() });
+    }
 }
 
 // entry-point recovery
@@ -932,11 +965,11 @@ test "original entry uses the last valid candidate" {
     try std.testing.expectEqual(code_rva, findOriginalEntry(@intFromPtr(&image), code).?);
 }
 
-fn restoreImports(base: usize, mode: Mode) bool {
+fn restoreImports(base: usize, mode: Mode) !void {
     const allocator = std.heap.page_allocator;
     var decoded = switch (mode) {
         .std => blk: {
-            const layout = findProtectedImports(base) orelse return false;
+            const layout = findProtectedImports(base) orelse return error.ImportTableNotFound;
             break :blk recipe.decode(
                 allocator,
                 base,
@@ -944,13 +977,16 @@ fn restoreImports(base: usize, mode: Mode) bool {
                 layout.section_size,
                 layout.table_end_rva,
                 layout.pointer_slots + layout.ordinal_slots,
-            ) catch return false;
+            );
         },
-        .tp6 => recipe.decodeFromEmbeddedTable(allocator, base) catch return false,
+        .tp6 => recipe.decodeFromEmbeddedTable(allocator, base),
+    } catch |err| {
+        std.log.err("import recipe decode failed: {s}", .{@errorName(err)});
+        return err;
     };
     defer decoded.deinit(allocator);
 
-    const cache = allocator.alloc(ModuleCache, decoded.module_runs) catch return false;
+    const cache = try allocator.alloc(ModuleCache, decoded.module_runs);
     defer allocator.free(cache);
     var cache_count: usize = 0;
 
@@ -966,20 +1002,32 @@ fn restoreImports(base: usize, mode: Mode) bool {
             const encoded_length: u32 = @truncate(record.metadata >> 32);
             const expected_length: usize = if (encoded_length >= 2) encoded_length - 2 else 0;
             module = findModule(record.module_hash, expected_length);
-            if (module == null) return false;
+            if (module == null) {
+                std.log.err("import module hash 0x{x} not found for slot 0x{x}", .{ record.module_hash, record.slot_rva });
+                return error.ImportModuleNotFound;
+            }
             cache[cache_count] = .{ .hash = record.module_hash, .module = module };
             cache_count += 1;
         }
 
-        const address = if (record.ordinal != 0)
-            GetProcAddress(module, @ptrFromInt(@as(usize, record.ordinal)))
-        else
-            resolveNamed(module, record.name_hash);
-        const resolved = address orelse return false;
-        if (!writeImport(base, record.slot_rva, @intFromPtr(resolved))) return false;
+        var address: *const anyopaque = undefined;
+        if (record.ordinal != 0) {
+            address = GetProcAddress(module, @ptrFromInt(@as(usize, record.ordinal))) orelse {
+                std.log.err("import ordinal {d} missing in module 0x{x} at slot 0x{x}", .{ record.ordinal, record.module_hash, record.slot_rva });
+                return error.ImportOrdinalNotFound;
+            };
+        } else {
+            const named = resolveNamed(module, record.name_hash) orelse {
+                std.log.err("import name hash 0x{x} missing in module 0x{x} at slot 0x{x}", .{ record.name_hash, record.module_hash, record.slot_rva });
+                return error.ImportNameNotFound;
+            };
+            address = named.ptr orelse {
+                std.log.err("import {s} has no address at slot 0x{x}", .{ std.mem.span(named.name), record.slot_rva });
+                return error.ImportAddressNotFound;
+            };
+        }
+        try writeImport(base, record.slot_rva, @intFromPtr(address));
     }
-
-    return true;
 }
 
 pub fn protectionMode() Mode {
@@ -1076,47 +1124,50 @@ test "tp6 entry is uncovered trampoline" {
     try std.testing.expectEqual(@as(?u32, 0x501), findTp6Entry(base, code));
 }
 
-pub fn protectedEntry() ?usize {
+pub fn protectedEntry() !usize {
     const base = @intFromPtr(GetModuleHandleW(null));
-    if (base == 0 or rd16(base) != 0x5A4D) return null;
+    if (base == 0 or rd16(base) != 0x5A4D) return error.InvalidMainModule;
     const pe = base + rd32(base + 0x3C);
-    if (rd32(pe) != 0x00004550) return null;
+    if (rd32(pe) != 0x00004550) return error.InvalidMainModule;
     const entry_rva = rd32(pe + 0x28);
     return base + entry_rva;
 }
 
-pub fn disableTlsCallbacks() bool {
+pub fn disableTlsCallbacks() !void {
     const base = @intFromPtr(GetModuleHandleW(null));
-    if (base == 0 or rd16(base) != 0x5A4D) return false;
+    if (base == 0 or rd16(base) != 0x5A4D) return error.InvalidMainModule;
     const pe = base + rd32(base + 0x3C);
-    if (rd32(pe) != 0x00004550) return false;
+    if (rd32(pe) != 0x00004550) return error.InvalidMainModule;
     const optional = pe + 0x18;
     const tls_rva = rd32(optional + 112 + 9 * 8);
-    if (tls_rva == 0) return true;
+    if (tls_rva == 0) return;
     const callbacks = rd64(base + tls_rva + 24);
-    if (callbacks == 0) return true;
+    if (callbacks == 0) return;
 
     var old_protect: DWORD = 0;
-    if (VirtualProtect(@ptrFromInt(callbacks), @sizeOf(usize), PAGE_READWRITE, &old_protect) == 0) return false;
+    if (VirtualProtect(@ptrFromInt(callbacks), @sizeOf(usize), PAGE_READWRITE, &old_protect) == 0) {
+        std.log.err("TLS callback protection failed: Win32 {d}", .{GetLastError()});
+        return error.TlsProtectionFailed;
+    }
     @as(*align(1) usize, @ptrFromInt(callbacks)).* = 0;
     var ignored: DWORD = 0;
-    _ = VirtualProtect(@ptrFromInt(callbacks), @sizeOf(usize), old_protect, &ignored);
-    return true;
+    if (VirtualProtect(@ptrFromInt(callbacks), @sizeOf(usize), old_protect, &ignored) == 0) {
+        std.log.warn("TLS callback protection restore failed: Win32 {d}", .{GetLastError()});
+    }
 }
 
-pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usize, mode: Mode) ?usize {
+pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usize, mode: Mode) !usize {
     hooks.initialize(self_module);
     const base = @intFromPtr(GetModuleHandleW(null));
-    if (base == 0) return null;
-
-    const code = findProtectedCode(base) orelse return null;
-    if (!decryptText(base, code, preserved_address, preserved_size, mode)) return null;
-    if (!restoreSections(base, mode)) return null;
-    if (!restoreImports(base, mode)) return null;
+    if (base == 0) return error.InvalidMainModule;
+    const code = findProtectedCode(base) orelse return error.ProtectedCodeNotFound;
+    try decryptText(base, code, preserved_address, preserved_size, mode);
+    try restoreSections(base, mode);
+    try restoreImports(base, mode);
     const original_entry = switch (mode) {
         .std => findOriginalEntry(base, code),
         .tp6 => findTp6Entry(base, code),
-    } orelse return null;
-    if (!hooks.patchLoaded()) return null;
+    } orelse return error.OriginalEntryNotFound;
+    try hooks.patchLoaded();
     return base + original_entry;
 }

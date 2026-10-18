@@ -9,6 +9,7 @@ extern "kernel32" fn VirtualAlloc(address: ?*anyopaque, size: usize, allocation:
 extern "kernel32" fn VirtualFree(address: ?*anyopaque, size: usize, operation: u32) callconv(.winapi) i32;
 extern "kernel32" fn VirtualProtect(address: ?*anyopaque, size: usize, protection: u32, old: *u32) callconv(.winapi) i32;
 extern "kernel32" fn FlushInstructionCache(process: ?*anyopaque, address: ?*const anyopaque, size: usize) callconv(.winapi) i32;
+extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
 fn rd16(address: usize) u16 {
     return @as(*align(1) const u16, @ptrFromInt(address)).*;
@@ -76,8 +77,11 @@ fn findRun(data: []const u8, layout: Layout) ?Run {
     return null;
 }
 
-fn restoreRun(data: []const u8, run: Run, layout: Layout) bool {
-    const allocation = VirtualAlloc(null, run.code_size, 0x3000, 0x04) orelse return false;
+fn restoreRun(data: []const u8, run: Run, layout: Layout) !void {
+    const allocation = VirtualAlloc(null, run.code_size, 0x3000, 0x04) orelse {
+        std.log.err("native fragment allocation failed: Win32 {d}", .{GetLastError()});
+        return error.FragmentAllocationFailed;
+    };
     var installed = false;
     defer {
         if (!installed) _ = VirtualFree(allocation, 0, 0x8000);
@@ -96,9 +100,15 @@ fn restoreRun(data: []const u8, run: Run, layout: Layout) bool {
         offset += 16 + item.size;
     }
     var old: u32 = 0;
-    if (VirtualProtect(allocation, run.code_size, 0x20, &old) == 0) return false;
+    if (VirtualProtect(allocation, run.code_size, 0x20, &old) == 0) {
+        std.log.err("native fragment code protection failed: Win32 {d}", .{GetLastError()});
+        return error.FragmentCodeProtectionFailed;
+    }
     const tail = @as([*]u8, @ptrFromInt(layout.base + layout.tail))[0 .. layout.end - layout.tail];
-    if (VirtualProtect(tail.ptr, tail.len, 0x40, &old) == 0) return false;
+    if (VirtualProtect(tail.ptr, tail.len, 0x40, &old) == 0) {
+        std.log.err("native fragment tail protection failed: Win32 {d}", .{GetLastError()});
+        return error.FragmentTailProtectionFailed;
+    }
     offset = run.start;
     cursor = 0;
     while (offset < run.end) {
@@ -110,17 +120,22 @@ fn restoreRun(data: []const u8, run: Run, layout: Layout) bool {
         cursor += item.size + 19;
         offset += 16 + item.size;
     }
-    var ignored: u32 = 0;
-    _ = VirtualProtect(tail.ptr, tail.len, old, &ignored);
-    const process: *anyopaque = @ptrFromInt(std.math.maxInt(usize));
-    _ = FlushInstructionCache(process, allocation, run.code_size);
-    _ = FlushInstructionCache(process, tail.ptr, tail.len);
     installed = true;
-    return true;
+    var ignored: u32 = 0;
+    if (VirtualProtect(tail.ptr, tail.len, old, &ignored) == 0) {
+        std.log.warn("native fragment tail protection restore failed: Win32 {d}", .{GetLastError()});
+    }
+    const process: *anyopaque = @ptrFromInt(std.math.maxInt(usize));
+    if (FlushInstructionCache(process, allocation, run.code_size) == 0) {
+        std.log.warn("native fragment code cache flush failed: Win32 {d}", .{GetLastError()});
+    }
+    if (FlushInstructionCache(process, tail.ptr, tail.len) == 0) {
+        std.log.warn("native fragment tail cache flush failed: Win32 {d}", .{GetLastError()});
+    }
 }
 
-fn restorePayload(layout: Layout) bool {
-    const base = @intFromPtr(GetModuleHandleW(null));
+fn restorePayload(layout: Layout) !void {
+    const base = @intFromPtr(GetModuleHandleW(null) orelse return error.InvalidMainModule);
     const pe = base + rd32(base + 0x3c);
     const entry = rd32(pe + 0x28);
     const sections: [*]align(1) const coff.SectionHeader = @ptrFromInt(pe + 0x18 + rd16(pe + 0x14));
@@ -138,17 +153,16 @@ fn restorePayload(layout: Layout) bool {
                 !(address >= base + entry and address + 2 <= base + entry + interceptor.replacement_size)) continue;
             const allocator = std.heap.page_allocator;
             const data = compression.decode(allocator, bytes[start..], compression.dictionary_size) catch |err| {
-                if (err == error.OutOfMemory) return false;
+                if (err == error.OutOfMemory) return err;
                 continue;
             };
             defer allocator.free(data);
             if (findRun(data, layout)) |run| return restoreRun(data, run, layout);
         }
     }
-    return true;
 }
 
-pub fn restore(module: ?*anyopaque) bool {
+pub fn restore(module: ?*anyopaque) !void {
     const base = @intFromPtr(module);
     const pe = base + rd32(base + 0x3c);
     const sections: [*]align(1) const coff.SectionHeader = @ptrFromInt(pe + 0x18 + rd16(pe + 0x14));
@@ -161,9 +175,8 @@ pub fn restore(module: ?*anyopaque) bool {
         };
         const tail = @as([*]const u8, @ptrFromInt(base + layout.tail))[0 .. layout.end - layout.tail];
         if (std.mem.indexOf(u8, tail, "\xff\x25") != null) continue;
-        if (!restorePayload(layout)) return false;
+        try restorePayload(layout);
     }
-    return true;
 }
 
 test "fragment run includes call-site junk and unreferenced continuations" {

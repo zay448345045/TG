@@ -16,20 +16,39 @@ extern "kernel32" fn FreeLibrary(module: HMODULE) callconv(.winapi) BOOL;
 extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) HMODULE;
 extern "kernel32" fn VirtualProtect(address: ?*anyopaque, size: usize, protection: DWORD, old: *DWORD) callconv(.winapi) BOOL;
 extern "kernel32" fn K32EnumProcessModules(process: HANDLE, modules: [*]HMODULE, bytes: DWORD, needed: *DWORD) callconv(.winapi) BOOL;
+extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 
 fn patchDependencies(module: HMODULE) HMODULE {
     if (module == null or module == self or isSystemLoader(module)) return module;
-    return if (patchLoaded()) module else null;
+    patchLoaded() catch |err| {
+        std.log.err("loaded module patch failed: {s}", .{@errorName(err)});
+        _ = FreeLibrary(module);
+        return null;
+    };
+    return module;
 }
 
-pub fn patchLoaded() bool {
-    var modules: [1024]HMODULE = undefined;
-    var needed: DWORD = 0;
-    if (K32EnumProcessModules(@ptrFromInt(std.math.maxInt(usize)), &modules, @sizeOf(@TypeOf(modules)), &needed) == 0) return false;
-    for (modules[0..@min(needed / @sizeOf(HMODULE), modules.len)]) |loaded| {
-        if (!patch(loaded)) return false;
+pub fn patchLoaded() !void {
+    var stack: [1024]HMODULE = undefined;
+    var owned: ?[]HMODULE = null;
+    defer if (owned) |buffer| std.heap.page_allocator.free(buffer);
+    var modules: []HMODULE = &stack;
+    while (true) {
+        var needed: DWORD = 0;
+        if (K32EnumProcessModules(@ptrFromInt(std.math.maxInt(usize)), modules.ptr, @intCast(modules.len * @sizeOf(HMODULE)), &needed) == 0) {
+            std.log.err("module enumeration failed: Win32 {d}", .{GetLastError()});
+            return error.ModuleEnumerationFailed;
+        }
+        if (needed <= modules.len * @sizeOf(HMODULE)) {
+            for (modules[0 .. needed / @sizeOf(HMODULE)]) |loaded| try patch(loaded);
+            return;
+        }
+        const count = (@as(usize, needed) + @sizeOf(HMODULE) - 1) / @sizeOf(HMODULE);
+        const larger = try std.heap.page_allocator.alloc(HMODULE, count);
+        if (owned) |buffer| std.heap.page_allocator.free(buffer);
+        owned = larger;
+        modules = larger;
     }
-    return true;
 }
 
 const blocked: []const []const u8 = &.{
@@ -47,8 +66,14 @@ pub fn initialize(module: HMODULE) void {
     inline for (.{ "kernel32.dll", "kernelbase.dll", "ntdll.dll" }, 0..) |library, library_index| {
         const handle = GetModuleHandleW(std.unicode.utf8ToUtf16LeStringLiteral(library));
         loader_modules[library_index] = handle;
+        if (handle == null) std.log.err("loader module {s} not present", .{library});
         if (library_index < original_addresses.len) {
-            inline for (load_names, 0..) |name, index| original_addresses[library_index][index] = @intFromPtr(GetProcAddress(handle, name));
+            inline for (load_names, 0..) |name, index| {
+                original_addresses[library_index][index] = if (handle) |loaded|
+                    if (GetProcAddress(loaded, name)) |address| @intFromPtr(address) else 0
+                else
+                    0;
+            }
         }
     }
 }
@@ -69,30 +94,39 @@ fn isSystemLoader(module: HMODULE) bool {
 }
 
 // resolved import slots
-fn patch(module: HMODULE) bool {
-    if (module == null or module == self or isSystemLoader(module)) return true;
+fn patch(module: HMODULE) !void {
+    if (module == null or module == self or isSystemLoader(module)) return;
     const base = @intFromPtr(module);
     const pe = base + @as(*align(1) const u32, @ptrFromInt(base + 0x3c)).*;
     const import_rva = @as(*align(1) const u32, @ptrFromInt(pe + 0x90)).*;
-    if (import_rva == 0) return fragments.restore(module);
-    var descriptor = base + import_rva;
-    while (@as(*align(1) const u32, @ptrFromInt(descriptor + 12)).* != 0) : (descriptor += 20) {
-        const thunk_rva = @as(*align(1) const u32, @ptrFromInt(descriptor + 16)).*;
-        if (thunk_rva == 0) continue;
-        var slot: *align(1) usize = @ptrFromInt(base + thunk_rva);
-        while (slot.* != 0) {
-            const replacement = redirect(slot.*);
-            if (replacement != slot.*) {
-                var old: DWORD = 0;
-                if (VirtualProtect(slot, @sizeOf(usize), 0x04, &old) == 0) return false;
-                slot.* = replacement;
-                var ignored: DWORD = 0;
-                _ = VirtualProtect(slot, @sizeOf(usize), old, &ignored);
+    if (import_rva != 0) {
+        var descriptor = base + import_rva;
+        while (@as(*align(1) const u32, @ptrFromInt(descriptor + 12)).* != 0) : (descriptor += 20) {
+            const thunk_rva = @as(*align(1) const u32, @ptrFromInt(descriptor + 16)).*;
+            if (thunk_rva == 0) continue;
+            var slot: *align(1) usize = @ptrFromInt(base + thunk_rva);
+            while (slot.* != 0) {
+                const replacement = redirect(slot.*);
+                if (replacement != slot.*) {
+                    var old: DWORD = 0;
+                    if (VirtualProtect(slot, @sizeOf(usize), 0x04, &old) == 0) {
+                        std.log.err("hook slot 0x{x} protection failed: Win32 {d}", .{ @intFromPtr(slot), GetLastError() });
+                        return error.HookProtectionFailed;
+                    }
+                    slot.* = replacement;
+                    var ignored: DWORD = 0;
+                    if (VirtualProtect(slot, @sizeOf(usize), old, &ignored) == 0) {
+                        std.log.warn("hook slot 0x{x} protection restore failed: Win32 {d}", .{ @intFromPtr(slot), GetLastError() });
+                    }
+                }
+                slot = @ptrFromInt(@intFromPtr(slot) + @sizeOf(usize));
             }
-            slot = @ptrFromInt(@intFromPtr(slot) + @sizeOf(usize));
         }
     }
-    return fragments.restore(module);
+    fragments.restore(module) catch |err| {
+        std.log.err("native fragment restore failed in module 0x{x}: {s}", .{ base, @errorName(err) });
+        return err;
+    };
 }
 
 fn isBlockedAscii(path: []const u8) bool {
