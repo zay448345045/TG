@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Config = struct {
+    shims: []const [:0]const u8,
     dumps: struct {
         text: bool = false,
         sections: bool = false,
@@ -20,6 +21,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const options = b.addOptions();
+    options.addOption([]const [:0]const u8, "shims", config.shims);
     options.addOption(bool, "dump_text", config.dumps.text);
     options.addOption(bool, "dump_sections", config.dumps.sections);
     options.addOption(bool, "dump_imports", config.dumps.imports);

@@ -2,6 +2,14 @@
 const std = @import("std");
 const fragments = @import("fragments.zig");
 
+const build_options = @import("build_options");
+const blocked: []const []const u8 = &.{
+    "ACE-Base64.dll",
+    // DLL basenames to block, such as PerfSight.dll
+};
+
+const shims = build_options.shims;
+
 const BOOL = i32;
 const DWORD = u32;
 const HANDLE = ?*anyopaque;
@@ -51,15 +59,19 @@ pub fn patchLoaded() !void {
     }
 }
 
-const blocked: []const []const u8 = &.{
-    "ACE-Base64.dll",
-    // add DLL basenames to block such as PerfSight.dll
-};
-
 var self: HMODULE = null;
 const load_names = .{ "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW", "GetProcAddress", "FreeLibrary" };
 var original_addresses: [2][load_names.len]usize = undefined;
 var loader_modules: [3]HMODULE = undefined;
+
+pub fn loadShims() !void {
+    for (shims) |path| {
+        if (LoadLibraryA(path) == null) {
+            std.log.err("DLL {s} load failed: Win32 {d}", .{ path, GetLastError() });
+            return error.ShimLoadFailed;
+        }
+    }
+}
 
 pub fn initialize(module: HMODULE) void {
     self = module;

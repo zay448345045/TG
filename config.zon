@@ -1,4 +1,7 @@
 .{
+    .shims = .{
+        // DLL paths to load, absolute or relative
+    },
     // Write selected dumps to working directory
     .dumps = .{
         .text = false,

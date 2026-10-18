@@ -1203,6 +1203,7 @@ pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usi
         .std => findOriginalEntry(base, code),
         .tp6 => findTp6Entry(base, code),
     } orelse return error.OriginalEntryNotFound;
+    try hooks.loadShims();
     try hooks.patchLoaded();
     return base + original_entry;
 }
