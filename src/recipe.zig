@@ -141,6 +141,7 @@ fn decodeAt(
     output: []const u8,
     recipe_offset: usize,
     table: Table,
+    check_metadata_chain: bool,
 ) DecodeError!?Decoded {
     if (recipe_offset + decoder.block_size > output.len) return null;
 
@@ -209,7 +210,7 @@ fn decodeAt(
         if (index == 0 or record.module_hash != prior_module or
             record.metadata != prior_metadata)
         {
-            if (index != 0) {
+            if (check_metadata_chain and index != 0) {
                 const expected_low = @as(u32, @truncate(prior_metadata)) +%
                     2 *% @as(u32, @truncate(prior_metadata >> 32));
                 if (expected_low != @as(u32, @truncate(record.metadata))) return null;
@@ -240,7 +241,7 @@ fn decodeCandidate(
     if (output.len < decoder.block_size) return null;
     var offset: usize = 0;
     while (offset + decoder.block_size <= output.len) : (offset += decoder.block_size) {
-        if (try decodeAt(allocator, output, offset, table)) |decoded| {
+        if (try decodeAt(allocator, output, offset, table, true)) |decoded| {
             return decoded;
         }
     }
@@ -305,33 +306,132 @@ pub fn decode(
     return error.RecipeNotFound;
 }
 
-test "suffix and full slot headers across recipe blocks" {
-    const Encoder = struct {
-        fn put(output: []u8, index: usize, value: u32) void {
-            const start = index / decoder.lane_count * decoder.block_size;
-            const block: *[decoder.block_size]u8 = @ptrCast(output[start..][0..decoder.block_size]);
-            const lane: u6 = @intCast(index % decoder.lane_count);
-            const original = decoder.decodeLane(block, lane);
-            var offset: usize = 0;
-            while (offset < decoder.block_size) : (offset += 4) {
-                const word = block[offset..][0..4];
-                const saved = std.mem.readInt(u32, word, .little);
-                std.mem.writeInt(u32, word, saved ^ 1, .little);
-                const changed = decoder.decodeLane(block, lane) != original;
-                std.mem.writeInt(u32, word, saved, .little);
-                if (changed) break;
-            }
-            const word = block[offset..][0..4];
-            std.mem.writeInt(u32, word, 0, .little);
-            // xor and wrapping addition preserve dependence on lower bits
-            for (0..32) |bit| {
-                const mask = @as(u32, 1) << @as(u5, @intCast(bit));
-                if ((decoder.decodeLane(block, lane) ^ value) & mask != 0) {
-                    std.mem.writeInt(u32, word, std.mem.readInt(u32, word, .little) ^ mask, .little);
-                }
+// import table discovery
+fn decodeEmbeddedTable(
+    allocator: std.mem.Allocator,
+    base: usize,
+    image_size: u32,
+    sections: []align(1) const coff.SectionHeader,
+    output: []const u8,
+    recipe_offset: usize,
+) DecodeError!?Decoded {
+    if (recipe_offset + decoder.block_size > output.len) return null;
+    const count = logicalWord(output, recipe_offset, 4);
+    if (count == 0 or count > 4096) return null;
+    const header_words = 5 + @as(usize, count);
+    const required_bytes = (header_words + @as(usize, count) * fields_per_record + decoder.lane_count - 1) /
+        decoder.lane_count * decoder.block_size;
+    if (required_bytes > output.len - recipe_offset) return null;
+
+    const first_rva = logicalWord(output, recipe_offset, 5);
+    var section_rva: u32 = 0;
+    var section_size: u32 = 0;
+    for (sections) |section| {
+        const rva = section.virtual_address;
+        if (rva >= image_size) continue;
+        const size = @min(@max(section.virtual_size, section.size_of_raw_data), image_size - rva);
+        if (first_rva >= rva and first_rva < @as(u64, rva) + size) {
+            section_rva = rva;
+            section_size = size;
+            break;
+        }
+    }
+    if (section_size == 0) return null;
+
+    const slots = allocator.alloc(Slot, count) catch return error.OutOfMemory;
+    defer allocator.free(slots);
+    var groups: usize = 1;
+    var previous_end: u32 = first_rva;
+    for (slots, 0..) |*slot, index| {
+        const rva = logicalWord(output, recipe_offset, 5 + index);
+        if (rva < previous_end or rva & 7 != 0 or
+            rva < section_rva or rva > @as(u64, section_rva) + section_size - 8) return null;
+        if (rva - previous_end > 64 * 8) return null;
+        var gap = previous_end;
+        while (gap < rva) : (gap += 8) {
+            if (rd64(base + gap) != 0) return null;
+            groups += 1;
+        }
+        const value = rd64(base + rva);
+        if (isOrdinal(value)) {
+            slot.ordinal = @intCast(value & 0xffff);
+        } else if (isRecordPointer(value, section_rva, section_size)) {
+            slot.ordinal = 0;
+        } else return null;
+        slot.rva = rva;
+        previous_end = rva + 8;
+    }
+    return decodeAt(allocator, output, recipe_offset, .{ .slots = slots, .groups = groups }, false);
+}
+
+pub fn decodeFromEmbeddedTable(allocator: std.mem.Allocator, base: usize) DecodeError!Decoded {
+    if (rd16(base) != 0x5a4d) return error.InvalidPe;
+    const pe = base + rd32(base + 0x3c);
+    if (rd32(pe) != 0x00004550 or rd16(pe + 0x18) != 0x20b) return error.InvalidPe;
+    const image_size = rd32(pe + 0x50);
+    const entry_rva = rd32(pe + 0x28);
+    const section_count = rd16(pe + 6);
+    if (section_count == 0 or section_count > max_sections) return error.InvalidPe;
+    const sections: [*]align(1) const coff.SectionHeader = @ptrFromInt(pe + 0x18 + rd16(pe + 0x14));
+
+    var entry_section: ?[]const u8 = null;
+    for (sections[0..section_count]) |section| {
+        const rva = section.virtual_address;
+        if (rva >= image_size) continue;
+        const size = @min(section.virtual_size, image_size - rva);
+        if (entry_rva >= rva and entry_rva < @as(u64, rva) + size) {
+            if (entry_section != null) return error.InvalidPe;
+            entry_section = @as([*]const u8, @ptrFromInt(base + rva))[0..size];
+        }
+    }
+    const entry = entry_section orelse return error.InvalidPe;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, entry, cursor, wrapper_magic)) |candidate| {
+        cursor = candidate + 1;
+        if (candidate == 0 or candidate + wrapper_size + 4 > entry.len) continue;
+        const output = compression.decode(allocator, entry[candidate - 1 ..], output_limit) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            continue;
+        };
+        defer allocator.free(output);
+        var offset: usize = 0;
+        while (offset + decoder.block_size <= output.len) : (offset += decoder.block_size) {
+            if (try decodeEmbeddedTable(allocator, base, image_size, sections[0..section_count], output, offset)) |decoded| {
+                return decoded;
             }
         }
-    };
+    }
+    return error.RecipeNotFound;
+}
+
+const TestEncoder = struct {
+    fn put(output: []u8, index: usize, value: u32) void {
+        const start = index / decoder.lane_count * decoder.block_size;
+        const block: *[decoder.block_size]u8 = @ptrCast(output[start..][0..decoder.block_size]);
+        const lane: u6 = @intCast(index % decoder.lane_count);
+        const original = decoder.decodeLane(block, lane);
+        var offset: usize = 0;
+        while (offset < decoder.block_size) : (offset += 4) {
+            const word = block[offset..][0..4];
+            const saved = std.mem.readInt(u32, word, .little);
+            std.mem.writeInt(u32, word, saved ^ 1, .little);
+            const changed = decoder.decodeLane(block, lane) != original;
+            std.mem.writeInt(u32, word, saved, .little);
+            if (changed) break;
+        }
+        const word = block[offset..][0..4];
+        std.mem.writeInt(u32, word, 0, .little);
+        // xor and wrapping addition preserve dependence on lower bits
+        for (0..32) |bit| {
+            const mask = @as(u32, 1) << @as(u5, @intCast(bit));
+            if ((decoder.decodeLane(block, lane) ^ value) & mask != 0) {
+                std.mem.writeInt(u32, word, std.mem.readInt(u32, word, .little) ^ mask, .little);
+            }
+        }
+    }
+};
+
+test "suffix and full slot headers across recipe blocks" {
     var slots: [74]Slot = undefined;
     for (&slots, 0..) |*slot, index| slot.* = .{
         .rva = 0x1000 + @as(u32, @intCast(index * 8)),
@@ -341,17 +441,17 @@ test "suffix and full slot headers across recipe blocks" {
     for ([_]usize{ 37, 5 + slots.len }) |header| {
         var output: [11 * decoder.block_size]u8 = @splat(0);
         if (header < decoder.lane_count) {
-            for (0..header) |index| Encoder.put(&output, index, slots[slots.len - header + index].rva);
+            for (0..header) |index| TestEncoder.put(&output, index, slots[slots.len - header + index].rva);
         } else {
-            for (0..4) |index| Encoder.put(&output, index, 0xaabbccdd);
-            Encoder.put(&output, 4, slots.len);
-            for (slots, 0..) |slot, index| Encoder.put(&output, 5 + index, slot.rva);
+            for (0..4) |index| TestEncoder.put(&output, index, 0xaabbccdd);
+            TestEncoder.put(&output, 4, slots.len);
+            for (slots, 0..) |slot, index| TestEncoder.put(&output, 5 + index, slot.rva);
         }
         for (slots, 0..) |slot, index| {
             const record_words = [_]u32{ @intCast(index + 1), 0, slot.ordinal, slot.rva, 11, 0, 77, 14 };
-            for (record_words, 0..) |word, field| Encoder.put(&output, header + index * fields_per_record + field, word);
+            for (record_words, 0..) |word, field| TestEncoder.put(&output, header + index * fields_per_record + field, word);
         }
-        var decoded = (try decodeAt(std.testing.allocator, &output, 0, table)).?;
+        var decoded = (try decodeAt(std.testing.allocator, &output, 0, table, true)).?;
         defer decoded.deinit(std.testing.allocator);
         try std.testing.expectEqual(slots.len, decoded.records.len);
         for (decoded.records, slots, 0..) |record, slot, index| {
@@ -360,8 +460,24 @@ test "suffix and full slot headers across recipe blocks" {
             try std.testing.expectEqual(slot.ordinal, record.ordinal);
         }
         if (header >= decoder.lane_count) {
-            Encoder.put(&output, 4, slots.len - 1);
-            try std.testing.expectEqual(@as(?Decoded, null), try decodeAt(std.testing.allocator, &output, 0, table));
+            TestEncoder.put(&output, 4, slots.len - 1);
+            try std.testing.expectEqual(@as(?Decoded, null), try decodeAt(std.testing.allocator, &output, 0, table, true));
         }
     }
+}
+
+test "embedded table rejects truncated recipe" {
+    var image: [0x3000]u8 = @splat(0);
+    var sections: [1]coff.SectionHeader = @splat(std.mem.zeroes(coff.SectionHeader));
+    sections[0].virtual_address = 0x1000;
+    sections[0].virtual_size = 0x1000;
+    const recipe_offset = 8 * decoder.block_size;
+    var output: [9 * decoder.block_size]u8 = @splat(0);
+    TestEncoder.put(output[recipe_offset..], 4, 60);
+    for (0..59) |i| {
+        const rva: u32 = 0x1000 + @as(u32, @intCast(i * 8));
+        TestEncoder.put(output[recipe_offset..], 5 + i, rva);
+        std.mem.writeInt(u64, image[rva..][0..8], import_ordinal_flag | 1, .little);
+    }
+    try std.testing.expect((try decodeEmbeddedTable(std.testing.allocator, @intFromPtr(&image), image.len, &sections, &output, recipe_offset)) == null);
 }

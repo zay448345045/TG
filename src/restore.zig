@@ -63,6 +63,8 @@ const ProtectedImports = struct {
     ordinal_slots: usize,
 };
 
+pub const Mode = enum { std, tp6 };
+
 const ModuleCache = struct {
     hash: u64,
     module: HMODULE,
@@ -325,7 +327,39 @@ fn findTextKey(base: usize, code: ProtectedCode) ?TextKey {
     return scanTextKey(base, code, true) orelse scanTextKey(base, code, false);
 }
 
-fn decryptText(base: usize, code: ProtectedCode, preserved_address: usize, preserved_size: usize) bool {
+fn hasPlainPadding(base: usize, code: ProtectedCode) bool {
+    const pe = base + rd32(base + 0x3c);
+    const optional = pe + 0x18;
+    const image_size = rd32(optional + 0x38);
+    const exception_rva = rd32(optional + 0x70 + 3 * 8);
+    const exception_size = rd32(optional + 0x70 + 3 * 8 + 4);
+    if (!rangeInImage(exception_rva, exception_size, image_size)) return false;
+
+    var previous_end: ?u32 = null;
+    var matches: usize = 0;
+    for (0..exception_size / 12) |index| {
+        const entry = base + exception_rva + index * 12;
+        const begin = rd32(entry);
+        const end = rd32(entry + 4);
+        if (begin < code.rva or begin >= end or
+            @as(u64, end) > @as(u64, code.rva) + code.virtual_size) continue;
+        if (previous_end) |last_end| {
+            var rva = (last_end + 7) & ~@as(u32, 7);
+            while (@as(u64, rva) + 8 <= begin) : (rva += 8) {
+                const word = rd64(base + rva);
+                if (word == 0 or word == 0x9090909090909090 or word == 0xcccccccccccccccc) {
+                    matches += 1;
+                    if (matches == 16) return true;
+                }
+            }
+        }
+        previous_end = end;
+    }
+    return false;
+}
+
+fn decryptText(base: usize, code: ProtectedCode, preserved_address: usize, preserved_size: usize, mode: Mode) bool {
+    if (mode == .tp6 and hasPlainPadding(base, code)) return true;
     const key = findTextKey(base, code) orelse return false;
     const text = base + code.rva;
     const e_step = key.step *% 4096;
@@ -398,7 +432,7 @@ fn decompressSection(base: usize, rva: u32, raw_size: u32, virtual_size: u32, fi
     return true;
 }
 
-fn restoreSections(base: usize) bool {
+fn restoreSections(base: usize, mode: Mode) bool {
     const pe = base + rd32(base + 0x3C);
     const section_count = rd16(pe + 6);
     const optional_size = rd16(pe + 0x14);
@@ -412,6 +446,42 @@ fn restoreSections(base: usize) bool {
         const raw_size = section.size_of_raw_data;
         if (raw_size < compression.header_size or rd32(base + rva) != 0x575757f8) continue;
         if (!decompressSection(base, rva, raw_size, virtual_size, file_alignment)) return false;
+    }
+
+    if (mode == .std) return true;
+
+    const entry_rva = rd32(pe + 0x28);
+    var entry_section: ?[]const u8 = null;
+    for (sections[0..section_count]) |section| {
+        if (entry_rva >= section.virtual_address and
+            entry_rva < @as(u64, section.virtual_address) + section.virtual_size)
+        {
+            entry_section = @as([*]const u8, @ptrFromInt(base + section.virtual_address))[0..section.virtual_size];
+            break;
+        }
+    }
+    const entry = entry_section orelse return false;
+    for (sections[0..section_count]) |section| {
+        if (section.size_of_raw_data != 0 or section.virtual_size == 0 or
+            !std.mem.eql(u8, section.name[0..4], ".tp6")) continue;
+        const padded_size = std.mem.alignForward(usize, section.virtual_size, file_alignment);
+        var cursor: usize = 0;
+        var restored = false;
+        while (std.mem.indexOfPos(u8, entry, cursor, compression.magic)) |candidate| {
+            cursor = candidate + 1;
+            const output = compression.decode(std.heap.page_allocator, entry[candidate..], padded_size) catch continue;
+            defer std.heap.page_allocator.free(output);
+            if (output.len != padded_size) continue;
+            var old_protect: DWORD = 0;
+            const destination: [*]u8 = @ptrFromInt(base + section.virtual_address);
+            if (VirtualProtect(destination, output.len, PAGE_READWRITE, &old_protect) == 0) return false;
+            @memcpy(destination[0..output.len], output);
+            var ignored: DWORD = 0;
+            _ = VirtualProtect(destination, output.len, old_protect, &ignored);
+            restored = true;
+            break;
+        }
+        if (!restored) return false;
     }
     return true;
 }
@@ -862,20 +932,25 @@ test "original entry uses the last valid candidate" {
     try std.testing.expectEqual(code_rva, findOriginalEntry(@intFromPtr(&image), code).?);
 }
 
-fn restoreImports(base: usize, code: ProtectedCode) ?u32 {
-    const layout = findProtectedImports(base) orelse return null;
+fn restoreImports(base: usize, mode: Mode) bool {
     const allocator = std.heap.page_allocator;
-    var decoded = recipe.decode(
-        allocator,
-        base,
-        layout.section_rva,
-        layout.section_size,
-        layout.table_end_rva,
-        layout.pointer_slots + layout.ordinal_slots,
-    ) catch return null;
+    var decoded = switch (mode) {
+        .std => blk: {
+            const layout = findProtectedImports(base) orelse return false;
+            break :blk recipe.decode(
+                allocator,
+                base,
+                layout.section_rva,
+                layout.section_size,
+                layout.table_end_rva,
+                layout.pointer_slots + layout.ordinal_slots,
+            ) catch return false;
+        },
+        .tp6 => recipe.decodeFromEmbeddedTable(allocator, base) catch return false,
+    };
     defer decoded.deinit(allocator);
 
-    const cache = allocator.alloc(ModuleCache, decoded.module_runs) catch return null;
+    const cache = allocator.alloc(ModuleCache, decoded.module_runs) catch return false;
     defer allocator.free(cache);
     var cache_count: usize = 0;
 
@@ -891,7 +966,7 @@ fn restoreImports(base: usize, code: ProtectedCode) ?u32 {
             const encoded_length: u32 = @truncate(record.metadata >> 32);
             const expected_length: usize = if (encoded_length >= 2) encoded_length - 2 else 0;
             module = findModule(record.module_hash, expected_length);
-            if (module == null) return null;
+            if (module == null) return false;
             cache[cache_count] = .{ .hash = record.module_hash, .module = module };
             cache_count += 1;
         }
@@ -900,11 +975,105 @@ fn restoreImports(base: usize, code: ProtectedCode) ?u32 {
             GetProcAddress(module, @ptrFromInt(@as(usize, record.ordinal)))
         else
             resolveNamed(module, record.name_hash);
-        const resolved = address orelse return null;
-        if (!writeImport(base, record.slot_rva, @intFromPtr(resolved))) return null;
+        const resolved = address orelse return false;
+        if (!writeImport(base, record.slot_rva, @intFromPtr(resolved))) return false;
     }
 
-    return findOriginalEntry(base, code);
+    return true;
+}
+
+pub fn protectionMode() Mode {
+    const base = @intFromPtr(GetModuleHandleW(null));
+    if (base == 0 or rd16(base) != 0x5a4d) return .std;
+    const pe = base + rd32(base + 0x3c);
+    if (rd32(pe) != 0x00004550) return .std;
+    const sections: [*]align(1) const coff.SectionHeader = @ptrFromInt(pe + 0x18 + rd16(pe + 0x14));
+    for (sections[0..rd16(pe + 6)]) |section| {
+        if (std.mem.eql(u8, section.name[0..4], ".tp6")) return .tp6;
+    }
+    return .std;
+}
+
+fn findTp6Entry(base: usize, code: ProtectedCode) ?u32 {
+    const pe = base + rd32(base + 0x3c);
+    const image_size = rd32(pe + 0x50);
+    const exception_rva = rd32(pe + 0x18 + 0x70 + 3 * 8);
+    const exception_size = rd32(pe + 0x18 + 0x70 + 3 * 8 + 4);
+    if (!rangeInImage(exception_rva, exception_size, image_size)) return null;
+    const sections: [*]align(1) const coff.SectionHeader = @ptrFromInt(pe + 0x18 + rd16(pe + 0x14));
+    var found: ?u32 = null;
+    for (sections[0..rd16(pe + 6)]) |section| {
+        if (!section.flags.MEM_EXECUTE or section.virtual_address <= code.rva) continue;
+        const rva = section.virtual_address;
+        if (rva >= image_size) continue;
+        const size = @min(section.virtual_size, image_size - rva);
+        if (size < 11) continue;
+        const bytes: [*]const u8 = @ptrFromInt(base + rva);
+        for (0..size - 10) |offset| {
+            const candidate = bytes[offset..][0..11];
+            if (candidate[0] != 0x40 or candidate[1] != 0x68 or candidate[6] != 0xe8) continue;
+            const candidate_rva = rva + @as(u32, @intCast(offset)) + 1;
+            const target = relativeTarget(candidate_rva + 10, std.mem.readInt(i32, candidate[7..11], .little)) orelse continue;
+            if (target < rva or target >= @as(u64, rva) + size) continue;
+            var covered = false;
+            for (0..exception_size / 12) |index| {
+                const entry = base + exception_rva + index * 12;
+                if (candidate_rva >= rd32(entry) and candidate_rva < rd32(entry + 4)) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) continue;
+            if (found != null) return null;
+            found = candidate_rva;
+        }
+    }
+    return found;
+}
+
+test "tp6 entry is uncovered trampoline" {
+    var image: [0x800]u8 = @splat(0);
+    const base = @intFromPtr(&image);
+    const pe = base + 0x80;
+    @as(*align(1) u32, @ptrFromInt(base + 0x3c)).* = 0x80;
+    @as(*align(1) u16, @ptrFromInt(pe + 6)).* = 2;
+    @as(*align(1) u16, @ptrFromInt(pe + 0x14)).* = 0xf0;
+    @as(*align(1) u32, @ptrFromInt(pe + 0x50)).* = image.len;
+    @as(*align(1) u32, @ptrFromInt(pe + 0xa0)).* = 0x280;
+    @as(*align(1) u32, @ptrFromInt(pe + 0xa4)).* = 12;
+    const sections: [*]align(1) coff.SectionHeader = @ptrFromInt(pe + 0x108);
+    sections[0].virtual_address = 0x300;
+    sections[0].virtual_size = 0x100;
+    sections[0].flags.MEM_EXECUTE = true;
+    sections[1].virtual_address = 0x500;
+    sections[1].virtual_size = 0x200;
+    sections[1].flags.MEM_EXECUTE = true;
+    for ([_]u32{ 0x520, 0x5a0 }) |rva| {
+        image[rva - 1] = 0x40;
+        image[rva] = 0x68;
+        image[rva + 5] = 0xe8;
+        std.mem.writeInt(i32, image[rva + 6 ..][0..4], @as(i32, @intCast(0x600 - rva - 10)), .little);
+    }
+    std.mem.writeInt(u32, image[0x280..][0..4], 0x5a0, .little);
+    std.mem.writeInt(u32, image[0x284..][0..4], 0x5b0, .little);
+    const code: ProtectedCode = .{ .rva = 0x300, .virtual_size = 0x100 };
+    try std.testing.expectEqual(@as(?u32, 0x520), findTp6Entry(base, code));
+    std.mem.writeInt(u32, image[0x280..][0..4], 0x580, .little);
+    std.mem.writeInt(u32, image[0x284..][0..4], 0x590, .little);
+    try std.testing.expectEqual(@as(?u32, null), findTp6Entry(base, code));
+    image[0x51f] = 0;
+    image[0x59f] = 0;
+    image[0x6f5] = 0x40;
+    image[0x6f6] = 0x68;
+    image[0x6fb] = 0xe8;
+    std.mem.writeInt(i32, image[0x6fc..0x700], -0x100, .little);
+    try std.testing.expectEqual(@as(?u32, 0x6f6), findTp6Entry(base, code));
+    sections[1].virtual_size = 11;
+    image[0x500] = 0x40;
+    image[0x501] = 0x68;
+    image[0x506] = 0xe8;
+    std.mem.writeInt(i32, image[0x507..0x50b], -11, .little);
+    try std.testing.expectEqual(@as(?u32, 0x501), findTp6Entry(base, code));
 }
 
 pub fn protectedEntry() ?usize {
@@ -935,16 +1104,19 @@ pub fn disableTlsCallbacks() bool {
     return true;
 }
 
-pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usize) ?usize {
+pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usize, mode: Mode) ?usize {
     hooks.initialize(self_module);
     const base = @intFromPtr(GetModuleHandleW(null));
     if (base == 0) return null;
 
     const code = findProtectedCode(base) orelse return null;
-    if (!decryptText(base, code, preserved_address, preserved_size)) return null;
-    if (!restoreSections(base)) return null;
-
-    const original_entry = restoreImports(base, code) orelse return null;
+    if (!decryptText(base, code, preserved_address, preserved_size, mode)) return null;
+    if (!restoreSections(base, mode)) return null;
+    if (!restoreImports(base, mode)) return null;
+    const original_entry = switch (mode) {
+        .std => findOriginalEntry(base, code),
+        .tp6 => findTp6Entry(base, code),
+    } orelse return null;
     if (!hooks.patchLoaded()) return null;
     return base + original_entry;
 }
