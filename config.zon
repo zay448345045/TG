@@ -1,4 +1,8 @@
 .{
+    .blocked = .{
+        "ACE-Base64.dll",
+        // DLL basenames to block, such as PerfSight.dll
+    },
     .shims = .{
         // DLL paths to load, absolute or relative
     },

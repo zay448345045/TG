@@ -3,11 +3,7 @@ const std = @import("std");
 const fragments = @import("fragments.zig");
 
 const build_options = @import("build_options");
-const blocked: []const []const u8 = &.{
-    "ACE-Base64.dll",
-    // DLL basenames to block, such as PerfSight.dll
-};
-
+const blocked = build_options.blocked;
 const shims = build_options.shims;
 
 const BOOL = i32;
@@ -141,8 +137,8 @@ fn patch(module: HMODULE) !void {
     };
 }
 
-fn isBlockedAscii(path: []const u8) bool {
-    for (blocked) |name| {
+fn isBlockedAscii(path: []const u8, names: []const []const u8) bool {
+    for (names) |name| {
         if (!std.ascii.endsWithIgnoreCase(path, name)) continue;
         const start = path.len - name.len;
         if (start == 0 or path[start - 1] == '\\' or path[start - 1] == '/') return true;
@@ -150,8 +146,8 @@ fn isBlockedAscii(path: []const u8) bool {
     return false;
 }
 
-fn isBlockedWide(path: []const u16) bool {
-    for (blocked) |name| {
+fn isBlockedWide(path: []const u16, names: []const []const u8) bool {
+    for (names) |name| {
         if (path.len < name.len) continue;
         const start = path.len - name.len;
         if (start != 0 and path[start - 1] != '\\' and path[start - 1] != '/') continue;
@@ -163,34 +159,35 @@ fn isBlockedWide(path: []const u16) bool {
 }
 
 test "ACE load matching" {
-    try std.testing.expect(isBlockedAscii("ACE-Base64.dll"));
-    try std.testing.expect(isBlockedAscii("C:\\Game\\AntiCheatExpert\\ace-base64.DLL"));
-    try std.testing.expect(!isBlockedAscii("not-ACE-Base64.dll"));
-    try std.testing.expect(!isBlockedAscii("ACE-Base64.dll.old"));
-    try std.testing.expect(!isBlockedAscii("PerfSight.dll"));
+    const sample: []const []const u8 = &.{"ACE-Base64.dll"};
+    try std.testing.expect(isBlockedAscii("ACE-Base64.dll", sample));
+    try std.testing.expect(isBlockedAscii("C:\\Game\\AntiCheatExpert\\ace-base64.DLL", sample));
+    try std.testing.expect(!isBlockedAscii("not-ACE-Base64.dll", sample));
+    try std.testing.expect(!isBlockedAscii("ACE-Base64.dll.old", sample));
+    try std.testing.expect(!isBlockedAscii("PerfSight.dll", sample));
     const ace_wide = std.unicode.utf8ToUtf16LeStringLiteral("C:\\Game\\ACE-Base64.dll");
     const perfsight_wide = std.unicode.utf8ToUtf16LeStringLiteral("PerfSight.dll");
-    try std.testing.expect(isBlockedWide(ace_wide[0..ace_wide.len]));
-    try std.testing.expect(!isBlockedWide(perfsight_wide[0..perfsight_wide.len]));
+    try std.testing.expect(isBlockedWide(ace_wide[0..ace_wide.len], sample));
+    try std.testing.expect(!isBlockedWide(perfsight_wide[0..perfsight_wide.len], sample));
 }
 
 pub fn loadLibraryA(name: [*:0]const u8) callconv(.winapi) HMODULE {
-    if (isBlockedAscii(std.mem.span(name))) return self;
+    if (isBlockedAscii(std.mem.span(name), blocked)) return self;
     return patchDependencies(LoadLibraryA(name));
 }
 
 pub fn loadLibraryW(name: [*:0]const u16) callconv(.winapi) HMODULE {
-    if (isBlockedWide(std.mem.span(name))) return self;
+    if (isBlockedWide(std.mem.span(name), blocked)) return self;
     return patchDependencies(LoadLibraryW(name));
 }
 
 pub fn loadLibraryExA(name: [*:0]const u8, file: HANDLE, flags: DWORD) callconv(.winapi) HMODULE {
-    if (isBlockedAscii(std.mem.span(name))) return self;
+    if (isBlockedAscii(std.mem.span(name), blocked)) return self;
     return patchDependencies(LoadLibraryExA(name, file, flags));
 }
 
 pub fn loadLibraryExW(name: [*:0]const u16, file: HANDLE, flags: DWORD) callconv(.winapi) HMODULE {
-    if (isBlockedWide(std.mem.span(name))) return self;
+    if (isBlockedWide(std.mem.span(name), blocked)) return self;
     return patchDependencies(LoadLibraryExW(name, file, flags));
 }
 
