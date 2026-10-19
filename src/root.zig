@@ -26,7 +26,7 @@ fn entryBootstrap() callconv(.winapi) windows.DWORD {
     std.log.info("entry bootstrap", .{});
     const target = restore.apply(@ptrCast(self_module), protected_entry, interceptor.replacement_size, .std) catch |err| {
         std.log.err("pre-entry setup failed: {s}", .{@errorName(err)});
-        return 0;
+        return 1;
     };
     std.log.info("reconstruction complete", .{});
     const entry: *const fn () callconv(.winapi) windows.DWORD = @ptrFromInt(target);
