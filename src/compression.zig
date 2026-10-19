@@ -24,7 +24,7 @@ pub fn decode(allocator: std.mem.Allocator, wrapper: []const u8, limit: usize) D
         return error.InvalidData;
     };
     defer decoder.deinit(allocator);
-    var dictionary = std.compress.lzma.Decode.CircularBuffer.init(dictionary_size, dictionary_size);
+    var dictionary = std.compress.lzma2.AccumBuffer.init(dictionary_size);
     defer dictionary.deinit(allocator);
     var sink: std.Io.Writer.Allocating = .init(allocator);
     defer sink.deinit();
