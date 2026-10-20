@@ -4,7 +4,6 @@ const coff = std.coff;
 const compression = @import("compression.zig");
 const interceptor = @import("interceptor.zig");
 
-extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn VirtualAlloc(address: ?*anyopaque, size: usize, allocation: u32, protection: u32) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn VirtualFree(address: ?*anyopaque, size: usize, operation: u32) callconv(.winapi) i32;
 extern "kernel32" fn VirtualProtect(address: ?*anyopaque, size: usize, protection: u32, old: *u32) callconv(.winapi) i32;
@@ -134,8 +133,7 @@ fn restoreRun(data: []const u8, run: Run, layout: Layout) !void {
     }
 }
 
-fn restorePayload(layout: Layout) !void {
-    const base = @intFromPtr(GetModuleHandleW(null) orelse return error.InvalidMainModule);
+fn restorePayload(layout: Layout, base: usize) !void {
     const pe = base + rd32(base + 0x3c);
     const entry = rd32(pe + 0x28);
     const sections: [*]align(1) const coff.SectionHeader = @ptrFromInt(pe + 0x18 + rd16(pe + 0x14));
@@ -162,7 +160,7 @@ fn restorePayload(layout: Layout) !void {
     }
 }
 
-pub fn restore(module: ?*anyopaque) !void {
+pub fn restore(module: ?*anyopaque, main_base: usize) !void {
     const base = @intFromPtr(module);
     const pe = base + rd32(base + 0x3c);
     const sections: [*]align(1) const coff.SectionHeader = @ptrFromInt(pe + 0x18 + rd16(pe + 0x14));
@@ -175,7 +173,7 @@ pub fn restore(module: ?*anyopaque) !void {
         };
         const tail = @as([*]const u8, @ptrFromInt(base + layout.tail))[0 .. layout.end - layout.tail];
         if (std.mem.indexOf(u8, tail, "\xff\x25") != null) continue;
-        try restorePayload(layout);
+        try restorePayload(layout, main_base);
     }
 }
 

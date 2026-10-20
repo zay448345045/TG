@@ -1192,9 +1192,9 @@ pub fn disableTlsCallbacks() !void {
 }
 
 pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usize, mode: Mode) !usize {
-    hooks.initialize(self_module);
     const base = @intFromPtr(GetModuleHandleW(null));
     if (base == 0) return error.InvalidMainModule;
+    hooks.initialize(self_module, base);
     const code = findProtectedCode(base) orelse return error.ProtectedCodeNotFound;
     try decryptText(base, code, preserved_address, preserved_size, mode);
     try restoreSections(base, mode);

@@ -1,6 +1,7 @@
 // library loader hooks
 const std = @import("std");
 const fragments = @import("fragments.zig");
+const windows = std.os.windows;
 
 const build_options = @import("build_options");
 const blocked = build_options.blocked;
@@ -56,6 +57,8 @@ pub fn patchLoaded() !void {
 }
 
 var self: HMODULE = null;
+var main_base: usize = 0;
+var patch_lock = windows.SRWLOCK_INIT;
 const load_names = .{ "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW", "GetProcAddress", "FreeLibrary" };
 var original_addresses: [2][load_names.len]usize = undefined;
 var loader_modules: [3]HMODULE = undefined;
@@ -69,8 +72,9 @@ pub fn loadShims() !void {
     }
 }
 
-pub fn initialize(module: HMODULE) void {
+pub fn initialize(module: HMODULE, base: usize) void {
     self = module;
+    main_base = base;
     inline for (.{ "kernel32.dll", "kernelbase.dll", "ntdll.dll" }, 0..) |library, library_index| {
         const handle = GetModuleHandleW(std.unicode.utf8ToUtf16LeStringLiteral(library));
         loader_modules[library_index] = handle;
@@ -104,6 +108,8 @@ fn isSystemLoader(module: HMODULE) bool {
 // resolved import slots
 fn patch(module: HMODULE) !void {
     if (module == null or module == self or isSystemLoader(module)) return;
+    windows.ntdll.RtlAcquireSRWLockExclusive(&patch_lock);
+    defer windows.ntdll.RtlReleaseSRWLockExclusive(&patch_lock);
     const base = @intFromPtr(module);
     const pe = base + @as(*align(1) const u32, @ptrFromInt(base + 0x3c)).*;
     const import_rva = @as(*align(1) const u32, @ptrFromInt(pe + 0x90)).*;
@@ -131,7 +137,7 @@ fn patch(module: HMODULE) !void {
             }
         }
     }
-    fragments.restore(module) catch |err| {
+    fragments.restore(module, main_base) catch |err| {
         std.log.err("native fragment restore failed in module 0x{x}: {s}", .{ base, @errorName(err) });
         return err;
     };
