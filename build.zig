@@ -9,6 +9,7 @@ const Config = struct {
         imports: bool = false,
     },
     console: bool = false,
+    mute_output: bool = false,
 };
 const config: Config = @import("config.zon");
 
@@ -29,6 +30,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "dump_sections", config.dumps.sections);
     options.addOption(bool, "dump_imports", config.dumps.imports);
     options.addOption(bool, "console", config.console);
+    options.addOption(bool, "mute_output", config.mute_output);
 
     const tpgate = b.addLibrary(.{
         .name = "tpgate",

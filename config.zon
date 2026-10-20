@@ -14,4 +14,6 @@
     },
     // Open a console before reconstruction
     .console = false,
+    // Mute stdout and stderr during reconstruction
+    .mute_output = false,
 }

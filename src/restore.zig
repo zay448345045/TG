@@ -1196,13 +1196,17 @@ pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usi
     if (base == 0) return error.InvalidMainModule;
     hooks.initialize(self_module, base);
     const code = findProtectedCode(base) orelse return error.ProtectedCodeNotFound;
-    try decryptText(base, code, preserved_address, preserved_size, mode);
-    try restoreSections(base, mode);
-    try restoreImports(base, mode);
-    const original_entry = switch (mode) {
-        .std => findOriginalEntry(base, code),
-        .tp6 => findTp6Entry(base, code),
-    } orelse return error.OriginalEntryNotFound;
+    const original_entry = blk: {
+        const muted = if (comptime build_options.mute_output) @import("console.zig").mute() else null;
+        defer if (muted) |output| output.restore();
+        try decryptText(base, code, preserved_address, preserved_size, mode);
+        try restoreSections(base, mode);
+        try restoreImports(base, mode);
+        break :blk switch (mode) {
+            .std => findOriginalEntry(base, code),
+            .tp6 => findTp6Entry(base, code),
+        } orelse return error.OriginalEntryNotFound;
+    };
     try hooks.loadShims();
     try hooks.patchLoaded();
     return base + original_entry;
