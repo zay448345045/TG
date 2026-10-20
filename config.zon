@@ -12,4 +12,6 @@
         .sections = false,
         .imports = false,
     },
+    // Open a console before reconstruction
+    .console = false,
 }

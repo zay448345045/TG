@@ -8,6 +8,7 @@ const Config = struct {
         sections: bool = false,
         imports: bool = false,
     },
+    console: bool = false,
 };
 const config: Config = @import("config.zon");
 
@@ -27,6 +28,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "dump_text", config.dumps.text);
     options.addOption(bool, "dump_sections", config.dumps.sections);
     options.addOption(bool, "dump_imports", config.dumps.imports);
+    options.addOption(bool, "console", config.console);
 
     const tpgate = b.addLibrary(.{
         .name = "tpgate",

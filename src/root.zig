@@ -1,5 +1,6 @@
 // tpshell entry bootstrap
 const std = @import("std");
+const build_options = @import("build_options");
 const interceptor = @import("interceptor.zig");
 const restore = @import("restore.zig");
 
@@ -9,20 +10,75 @@ pub const std_options: std.Options = .{ .logFn = logFn, .log_level = .info };
 
 extern "kernel32" fn OutputDebugStringA(message: [*:0]const u8) callconv(.winapi) void;
 
+const LogWriter = struct {
+    buffer: [512]u8 = undefined,
+    writer: std.Io.Writer = undefined,
+
+    fn init(self: *LogWriter) void {
+        self.writer = .{ .buffer = self.buffer[0 .. self.buffer.len - 1], .vtable = &.{ .drain = drain } };
+    }
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *LogWriter = @alignCast(@fieldParentPtr("writer", writer));
+        if (writer.end != 0) {
+            self.buffer[writer.end] = 0;
+            OutputDebugStringA(self.buffer[0..writer.end :0].ptr);
+            if (comptime build_options.console) @import("console.zig").write(self.buffer[0..writer.end]);
+            writer.end = 0;
+        }
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |part| {
+            self.output(part);
+            written += part.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            self.output(last);
+            written += last.len;
+        }
+        return written;
+    }
+
+    fn finish(self: *LogWriter) void {
+        const length = self.writer.end;
+        if (length == 0) {
+            if (comptime build_options.console) @import("console.zig").write("\n");
+            return;
+        }
+        self.buffer[length] = 0;
+        OutputDebugStringA(self.buffer[0..length :0].ptr);
+        if (comptime build_options.console) {
+            self.buffer[length] = '\n';
+            @import("console.zig").write(self.buffer[0 .. length + 1]);
+        }
+        self.writer.end = 0;
+    }
+
+    fn output(self: *LogWriter, bytes: []const u8) void {
+        var remaining = bytes;
+        while (remaining.len != 0) {
+            const length = @min(remaining.len, self.buffer.len - 1);
+            @memcpy(self.buffer[0..length], remaining[0..length]);
+            self.buffer[length] = 0;
+            OutputDebugStringA(self.buffer[0..length :0].ptr);
+            if (comptime build_options.console) @import("console.zig").write(self.buffer[0..length]);
+            remaining = remaining[length..];
+        }
+    }
+};
+
 fn logFn(comptime level: std.log.Level, comptime _: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
-    var buffer: [512]u8 = undefined;
-    const message = std.fmt.bufPrint(buffer[0 .. buffer.len - 1], "TPGate " ++ level.asText() ++ ": " ++ format, args) catch {
-        OutputDebugStringA("TPGate: log message too long");
-        return;
-    };
-    buffer[message.len] = 0;
-    OutputDebugStringA(buffer[0..message.len :0].ptr);
+    var log: LogWriter = .{};
+    log.init();
+    log.writer.print("TPGate " ++ level.asText() ++ ": " ++ format, args) catch {};
+    log.finish();
 }
 
 var protected_entry: usize = 0;
 var self_module: windows.HINSTANCE = undefined;
 
 fn entryBootstrap() callconv(.winapi) windows.DWORD {
+    if (comptime build_options.console) @import("console.zig").open();
     std.log.info("entry bootstrap", .{});
     const target = restore.apply(@ptrCast(self_module), protected_entry, interceptor.replacement_size, .std) catch |err| {
         std.log.err("pre-entry setup failed: {s}", .{@errorName(err)});
@@ -34,6 +90,7 @@ fn entryBootstrap() callconv(.winapi) windows.DWORD {
 }
 
 fn tp6Bootstrap(_: usize, _: usize) callconv(.winapi) windows.DWORD {
+    if (comptime build_options.console) @import("console.zig").open();
     std.log.info("TP6 entry bootstrap", .{});
     const target = restore.apply(@ptrCast(self_module), protected_entry, interceptor.replacement_size, .tp6) catch |err| {
         std.log.err("TP6 pre-entry setup failed: {s}", .{@errorName(err)});
