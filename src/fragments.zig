@@ -1,6 +1,7 @@
 // native fragment restoration
 const std = @import("std");
 const coff = std.coff;
+const build_options = @import("build_options");
 const compression = @import("compression.zig");
 const interceptor = @import("interceptor.zig");
 
@@ -131,6 +132,7 @@ fn restoreRun(data: []const u8, run: Run, layout: Layout) !void {
     if (FlushInstructionCache(process, tail.ptr, tail.len) == 0) {
         std.log.warn("native fragment tail cache flush failed: Win32 {d}", .{GetLastError()});
     }
+    if (comptime build_options.debug) std.log.debug("restored native fragments in module 0x{x}, {d} bytes", .{ layout.base, run.code_size });
 }
 
 fn restorePayload(layout: Layout, base: usize) !void {
@@ -158,6 +160,7 @@ fn restorePayload(layout: Layout, base: usize) !void {
             if (findRun(data, layout)) |run| return restoreRun(data, run, layout);
         }
     }
+    if (comptime build_options.debug) std.log.debug("no native fragment payload for module 0x{x}", .{layout.base});
 }
 
 pub fn restore(module: ?*anyopaque, main_base: usize) !void {
@@ -173,6 +176,7 @@ pub fn restore(module: ?*anyopaque, main_base: usize) !void {
         };
         const tail = @as([*]const u8, @ptrFromInt(base + layout.tail))[0 .. layout.end - layout.tail];
         if (std.mem.indexOf(u8, tail, "\xff\x25") != null) continue;
+        if (comptime build_options.debug) std.log.debug("module 0x{x} .tvm0 RVA 0x{x}, missing 0x{x} bytes", .{ base, section.virtual_address, tail.len });
         try restorePayload(layout, main_base);
     }
 }

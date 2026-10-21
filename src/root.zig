@@ -6,7 +6,7 @@ const restore = @import("restore.zig");
 
 const windows = std.os.windows;
 
-pub const std_options: std.Options = .{ .logFn = logFn, .log_level = .info };
+pub const std_options: std.Options = .{ .logFn = logFn, .log_level = if (build_options.debug) .debug else .info };
 
 extern "kernel32" fn OutputDebugStringA(message: [*:0]const u8) callconv(.winapi) void;
 

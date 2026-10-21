@@ -364,10 +364,12 @@ fn decryptText(base: usize, code: ProtectedCode, preserved_address: usize, prese
     const text = base + code.rva;
     const bytes: [*]u8 = @ptrFromInt(text);
     if (mode == .tp6 and hasPlainPadding(base, code)) {
+        if (comptime build_options.debug) std.log.debug("code RVA 0x{x} already plain", .{code.rva});
         if (comptime build_options.dump_text) @import("dumps.zig").writeFile("decrypted_text.bin", bytes[0..code.virtual_size]);
         return;
     }
     const key = (try findTextKey(base, code)) orelse return error.TextKeyNotFound;
+    if (comptime build_options.debug) std.log.debug("decrypting code RVA 0x{x}, size 0x{x}", .{ code.rva, code.virtual_size });
     const e_step = key.step *% 4096;
     var old_protect: DWORD = 0;
     if (VirtualProtect(@ptrFromInt(text), code.virtual_size, PAGE_EXECUTE_READWRITE, &old_protect) == 0) {
@@ -471,6 +473,7 @@ fn restoreSections(base: usize, mode: Mode) !void {
         const rva = section.virtual_address;
         const raw_size = section.size_of_raw_data;
         if (raw_size < compression.header_size or rd32(base + rva) != 0x575757f8) continue;
+        if (comptime build_options.debug) std.log.debug("decompressing {s} section RVA 0x{x}", .{ std.mem.sliceTo(section.name[0..], 0), rva });
         try decompressSection(base, rva, raw_size, virtual_size, file_alignment);
     }
 
@@ -490,6 +493,7 @@ fn restoreSections(base: usize, mode: Mode) !void {
     for (sections[0..section_count]) |section| {
         if (section.size_of_raw_data != 0 or section.virtual_size == 0 or
             !std.mem.eql(u8, section.name[0..4], ".tp6")) continue;
+        if (comptime build_options.debug) std.log.debug("restoring embedded {s} section RVA 0x{x}", .{ std.mem.sliceTo(section.name[0..], 0), section.virtual_address });
         const padded_size = std.mem.alignForward(usize, section.virtual_size, file_alignment);
         var cursor: usize = 0;
         var restored = false;
@@ -983,6 +987,7 @@ fn restoreImports(base: usize, mode: Mode) !void {
     var decoded = switch (mode) {
         .std => blk: {
             const layout = findProtectedImports(base) orelse return error.ImportTableNotFound;
+            if (comptime build_options.debug) std.log.debug("import table RVA 0x{x}, {d} slots", .{ layout.section_rva, layout.pointer_slots + layout.ordinal_slots });
             break :blk recipe.decode(
                 allocator,
                 base,
@@ -992,12 +997,16 @@ fn restoreImports(base: usize, mode: Mode) !void {
                 layout.pointer_slots + layout.ordinal_slots,
             );
         },
-        .tp6 => recipe.decodeFromEmbeddedTable(allocator, base),
+        .tp6 => blk: {
+            if (comptime build_options.debug) std.log.debug("decoding embedded import table", .{});
+            break :blk recipe.decodeFromEmbeddedTable(allocator, base);
+        },
     } catch |err| {
         std.log.err("import recipe decode failed: {s}", .{@errorName(err)});
         return err;
     };
     defer decoded.deinit(allocator);
+    if (comptime build_options.debug) std.log.debug("restoring {d} imports across {d} modules", .{ decoded.records.len, decoded.module_runs });
 
     var dump_records: ?[]@import("dumps.zig").Import = null;
     if (comptime build_options.dump_imports) {
@@ -1194,8 +1203,10 @@ pub fn disableTlsCallbacks() !void {
 pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usize, mode: Mode) !usize {
     const base = @intFromPtr(GetModuleHandleW(null));
     if (base == 0) return error.InvalidMainModule;
+    if (comptime build_options.debug) logSections(base);
     hooks.initialize(self_module, base);
     const code = findProtectedCode(base) orelse return error.ProtectedCodeNotFound;
+    if (comptime build_options.debug) std.log.debug("protected code RVA 0x{x}, size 0x{x}", .{ code.rva, code.virtual_size });
     const original_entry = blk: {
         const muted = if (comptime build_options.mute_output) @import("console.zig").mute() else null;
         defer if (muted) |output| output.restore();
@@ -1207,7 +1218,27 @@ pub fn apply(self_module: HMODULE, preserved_address: usize, preserved_size: usi
             .tp6 => findTp6Entry(base, code),
         } orelse return error.OriginalEntryNotFound;
     };
+    if (comptime build_options.debug) std.log.debug("original entry RVA 0x{x}", .{original_entry});
     try hooks.loadShims();
     try hooks.patchLoaded();
     return base + original_entry;
+}
+
+fn logSections(base: usize) void {
+    if (rd16(base) != 0x5a4d) return;
+    const pe = base + rd32(base + 0x3c);
+    if (rd32(pe) != 0x00004550) return;
+    const count = rd16(pe + 6);
+    const sections: [*]align(1) const coff.SectionHeader = @ptrFromInt(pe + 0x18 + rd16(pe + 0x14));
+    std.log.debug("executable sections: {d}", .{count});
+    for (sections[0..count], 0..) |section, index| {
+        std.log.debug("exe section {d} {s}: RVA 0x{x}, virtual 0x{x}, raw 0x{x}, flags 0x{x}", .{
+            index,
+            std.mem.sliceTo(section.name[0..], 0),
+            section.virtual_address,
+            section.virtual_size,
+            section.size_of_raw_data,
+            @as(u32, @bitCast(section.flags)),
+        });
+    }
 }

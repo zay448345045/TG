@@ -6,6 +6,8 @@
     .shims = .{
         // DLL paths to load, absolute or relative
     },
+    // Log executable sections and reconstruction details
+    .debug = false,
     // Write selected dumps to working directory
     .dumps = .{
         .text = false,
