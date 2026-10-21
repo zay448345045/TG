@@ -13,6 +13,7 @@ extern "kernel32" fn SetConsoleOutputCP(code_page: DWORD) callconv(.winapi) BOOL
 extern "kernel32" fn WriteFile(handle: HANDLE, data: [*]const u8, length: DWORD, written: *DWORD, overlap: ?*anyopaque) callconv(.winapi) BOOL;
 extern "kernel32" fn CreateFileA(name: [*:0]const u8, access: DWORD, share: DWORD, security: ?*anyopaque, disposition: DWORD, attributes: DWORD, template: HANDLE) callconv(.winapi) HANDLE;
 extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
+extern "kernel32" fn Sleep(milliseconds: DWORD) callconv(.winapi) void;
 
 fn stdoutSlot() *HANDLE {
     return @ptrCast(&std.os.windows.peb().ProcessParameters.hStdOutput);
@@ -25,14 +26,16 @@ fn stderrSlot() *HANDLE {
 var active = false;
 var log_handle: HANDLE = null;
 
-pub fn open() void {
-    if (GetConsoleWindow() == null and AllocConsole() == 0) {
+pub fn open() bool {
+    const created = GetConsoleWindow() == null;
+    if (created and AllocConsole() == 0) {
         std.log.err("console creation failed: Win32 {d}", .{GetLastError()});
-        return;
+        return false;
     }
     if (SetConsoleOutputCP(65001) == 0) std.log.warn("console UTF-8 setup failed: Win32 {d}", .{GetLastError()});
     if (comptime build_options.mute_output) log_handle = stderrSlot().*;
     @atomicStore(bool, &active, true, .release);
+    return created;
 }
 
 pub fn write(message: []const u8) void {
@@ -59,6 +62,17 @@ pub fn write(message: []const u8) void {
         }
         remaining = remaining[written..];
     }
+}
+
+pub fn waitAfterFailure() void {
+    write("Closing in 10 seconds.");
+    if (!@atomicLoad(bool, &active, .acquire)) return;
+    for (0..9) |_| {
+        Sleep(1000);
+        write(".");
+        if (!@atomicLoad(bool, &active, .acquire)) return;
+    }
+    Sleep(1000);
 }
 
 // reconstruction output

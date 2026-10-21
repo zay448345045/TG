@@ -78,10 +78,13 @@ var protected_entry: usize = 0;
 var self_module: windows.HINSTANCE = undefined;
 
 fn entryBootstrap() callconv(.winapi) windows.DWORD {
-    if (comptime build_options.console) @import("console.zig").open();
+    const created_console = if (comptime build_options.console) @import("console.zig").open() else false;
     std.log.info("entry bootstrap", .{});
     const target = restore.apply(@ptrCast(self_module), protected_entry, interceptor.replacement_size, .std) catch |err| {
         std.log.err("pre-entry setup failed: {s}", .{@errorName(err)});
+        if (comptime build_options.console) {
+            if (created_console) @import("console.zig").waitAfterFailure();
+        }
         return 1;
     };
     std.log.info("reconstruction complete", .{});
@@ -90,10 +93,13 @@ fn entryBootstrap() callconv(.winapi) windows.DWORD {
 }
 
 fn tp6Bootstrap(_: usize, _: usize) callconv(.winapi) windows.DWORD {
-    if (comptime build_options.console) @import("console.zig").open();
+    const created_console = if (comptime build_options.console) @import("console.zig").open() else false;
     std.log.info("TP6 entry bootstrap", .{});
     const target = restore.apply(@ptrCast(self_module), protected_entry, interceptor.replacement_size, .tp6) catch |err| {
         std.log.err("TP6 pre-entry setup failed: {s}", .{@errorName(err)});
+        if (comptime build_options.console) {
+            if (created_console) @import("console.zig").waitAfterFailure();
+        }
         return 1;
     };
     std.log.info("TP6 reconstruction complete", .{});
