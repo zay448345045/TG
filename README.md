@@ -2,7 +2,7 @@
 
 TPShell (and ACE) bypass for x86-64 Windows games.
 
-![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.0-blue)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-green)
 
 TPGate uses Zig 0.17.0, which you can download here:
